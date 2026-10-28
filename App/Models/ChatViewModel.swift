@@ -123,12 +123,6 @@ final class ChatViewModel {
             // so text reaches the screen at most every 50 ms.
             var pending = ""
             var lastFlush = Date.distantPast
-            func flush() {
-                guard !pending.isEmpty, let i = messages.firstIndex(where: { $0.id == id }) else { return }
-                messages[i].raw += pending
-                pending = ""
-                lastFlush = Date()
-            }
 
             do {
                 let stream = engine.generate(prompt: prompt.text, addBOS: builder.addBOS,
@@ -138,23 +132,33 @@ final class ChatViewModel {
                     switch event {
                     case .text(let piece):
                         pending += piece
-                        if Date().timeIntervalSince(lastFlush) >= 0.05 { flush() }
+                        if Date().timeIntervalSince(lastFlush) >= 0.05 {
+                            append(pending, to: id)
+                            pending = ""
+                            lastFlush = Date()
+                        }
                     case .done(let stats):
-                        flush()
+                        append(pending, to: id)
+                        pending = ""
                         if let i = messages.firstIndex(where: { $0.id == id }) { messages[i].stats = stats }
                     }
                 }
-                flush()
+                append(pending, to: id)
                 if stopRequested, let i = messages.firstIndex(where: { $0.id == id }) {
                     messages[i].stopped = true
                 }
             } catch {
-                flush()
+                append(pending, to: id)
                 if let i = messages.firstIndex(where: { $0.id == id }) {
                     messages[i].error = error.localizedDescription
                 }
             }
         }
+    }
+
+    private func append(_ text: String, to id: UUID) {
+        guard !text.isEmpty, let i = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[i].raw += text
     }
 
     /// Ends the reply at the next token. The stream still finishes normally,
