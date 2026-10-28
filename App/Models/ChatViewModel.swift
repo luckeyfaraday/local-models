@@ -126,7 +126,8 @@ final class ChatViewModel {
 
             do {
                 let stream = engine.generate(prompt: prompt.text, addBOS: builder.addBOS,
-                                             sampling: settings.preset.sampling, maxTokens: settings.maxTokens)
+                                             sampling: settings.preset.sampling, maxTokens: settings.maxTokens,
+                                             banned: prompt.banned)
                 for try await event in stream {
                     guard messages.contains(where: { $0.id == id }) else { break }
                     switch event {

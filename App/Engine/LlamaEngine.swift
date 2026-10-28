@@ -96,7 +96,8 @@ final class LlamaEngine: @unchecked Sendable {
         cancelLock.unlock()
     }
 
-    func generate(prompt: String, addBOS: Bool, sampling: Sampling, maxTokens: Int) -> AsyncThrowingStream<Event, Error> {
+    func generate(prompt: String, addBOS: Bool, sampling: Sampling, maxTokens: Int,
+                  banned: [String] = []) -> AsyncThrowingStream<Event, Error> {
         setCancelled(false)
         return AsyncThrowingStream { continuation in
             continuation.onTermination = { [weak self] reason in
@@ -104,7 +105,8 @@ final class LlamaEngine: @unchecked Sendable {
             }
             queue.async {
                 do {
-                    let stats = try self.generateNow(prompt: prompt, addBOS: addBOS, sampling: sampling, maxTokens: maxTokens) {
+                    let stats = try self.generateNow(prompt: prompt, addBOS: addBOS, sampling: sampling,
+                                                     maxTokens: maxTokens, banned: banned) {
                         continuation.yield(.text($0))
                     }
                     continuation.yield(.done(stats))
@@ -193,7 +195,8 @@ final class LlamaEngine: @unchecked Sendable {
         nCtx = 0
     }
 
-    private func generateNow(prompt: String, addBOS: Bool, sampling: Sampling, maxTokens: Int, emit: (String) -> Void) throws -> GenerationStats {
+    private func generateNow(prompt: String, addBOS: Bool, sampling: Sampling, maxTokens: Int, banned: [String],
+                             emit: (String) -> Void) throws -> GenerationStats {
         guard let ctx = context, let vocab else { throw EngineError.notLoaded }
 
         var tokens = tokenize(prompt, vocab: vocab)
@@ -207,7 +210,12 @@ final class LlamaEngine: @unchecked Sendable {
         // every turn starts from a clean memory and re-reads the whole chat.
         llama_memory_clear(llama_get_memory(ctx), true)
 
-        let sampler = makeSampler(sampling, vocab: vocab)
+        // Only single-token strings (special tags like <think>) can be banned.
+        let bannedTokens = banned.compactMap { text -> llama_token? in
+            let ids = tokenize(text, vocab: vocab)
+            return ids.count == 1 ? ids[0] : nil
+        }
+        let sampler = makeSampler(sampling, vocab: vocab, banned: bannedTokens)
         defer { llama_sampler_free(sampler) }
 
         var stats = GenerationStats()
@@ -263,8 +271,12 @@ final class LlamaEngine: @unchecked Sendable {
 
     // MARK: - Helpers
 
-    private func makeSampler(_ s: Sampling, vocab: OpaquePointer) -> UnsafeMutablePointer<llama_sampler> {
+    private func makeSampler(_ s: Sampling, vocab: OpaquePointer, banned: [llama_token]) -> UnsafeMutablePointer<llama_sampler> {
         let chain = llama_sampler_chain_init(llama_sampler_chain_default_params())!
+        if !banned.isEmpty {
+            let biases = banned.map { llama_logit_bias(token: $0, bias: -Float.infinity) }
+            llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), Int32(biases.count), biases))
+        }
         if s.repeatPenalty != 1 {
             llama_sampler_chain_add(chain, llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 64, s.repeatPenalty, 0, 0))
         }

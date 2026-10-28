@@ -14,6 +14,9 @@ struct RenderedPrompt {
     let text: String
     /// The prompt already opened a `<think>` block, so output starts as reasoning.
     let startsInThink: Bool
+    /// Text the model must never produce. With reasoning off, LFM3 sometimes
+    /// opens a fresh `<think>` anyway, so that tag gets banned.
+    var banned: [String] = []
 }
 
 /// Turns a chat into the exact prompt text a model expects.
@@ -86,10 +89,10 @@ struct PromptBuilder {
         switch style {
         case .lfm3:
             s += think ? "<think>" : "<think></think>"
-            return RenderedPrompt(text: s, startsInThink: think)
+            return RenderedPrompt(text: s, startsInThink: think, banned: think ? [] : ["<think>"])
         case .chatmlThinking:
             if !think { s += "<think>\n\n</think>\n\n" }
-            return RenderedPrompt(text: s, startsInThink: false)
+            return RenderedPrompt(text: s, startsInThink: false, banned: think ? [] : ["<think>"])
         default:
             return RenderedPrompt(text: s, startsInThink: false)
         }
