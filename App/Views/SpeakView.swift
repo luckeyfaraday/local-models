@@ -8,6 +8,7 @@ struct SpeakView: View {
     @AppStorage(SettingKey.speechVoice) private var voice = "female"
     @AppStorage(SettingKey.speechLanguage) private var language = "en"
     @State private var text = SpeechRequest.sample
+    @FocusState private var editing: Bool
 
     private var speech: SpeechViewModel { chat.speech }
 
@@ -17,6 +18,7 @@ struct SpeakView: View {
                 Section {
                     TextField("Text to speak", text: $text, axis: .vertical)
                         .lineLimit(3...10)
+                        .focused($editing)
                 }
                 Section {
                     Picker("Voice", selection: $voice) {
@@ -35,6 +37,7 @@ struct SpeakView: View {
                         }
                     } else {
                         Button {
+                            editing = false
                             speech.speak(SpeechRequest(text: text, voice: voice, language: language))
                         } label: {
                             Label("Speak", systemImage: "waveform")
@@ -51,10 +54,16 @@ struct SpeakView: View {
                 }
                 results
             }
+            .scrollDismissesKeyboard(.immediately)
             .navigationTitle("Speak")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                // The keyboard covers the Speak button, and return adds a new line.
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") { editing = false }
+                }
             }
             .onDisappear { speech.stop() }
         }
