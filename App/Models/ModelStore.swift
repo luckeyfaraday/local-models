@@ -23,6 +23,7 @@ final class ModelStore {
         let bytes: Int64
         var id: String { repo + "/" + path }
         var fileName: String { (path as NSString).lastPathComponent }
+        var isProjector: Bool { fileName.lowercased().contains("mmproj") }
         var downloadURL: URL {
             let encoded = path.split(separator: "/")
                 .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
@@ -37,9 +38,28 @@ final class ModelStore {
         var fraction: Double { expected > 0 ? Double(received) / Double(expected) : 0 }
     }
 
-    nonisolated static let defaultRepo = "LiquidAI/LFM3-1.7B-GGUF"
+    /// The models of a Hugging Face repo, and the projectors (mmproj) that give
+    /// them vision or audio.
+    struct Listing {
+        var models: [RemoteFile] = []
+        var projectors: [RemoteFile] = []
 
+        /// Q8_0 keeps the projector close to full quality at half the size of F16.
+        var bestProjector: RemoteFile? {
+            let ranked = ["Q8_0", "F16", "BF16"]
+            for tag in ranked {
+                if let p = projectors.first(where: { ModelStore.quantTag($0.fileName) == tag }) { return p }
+            }
+            return projectors.min { $0.bytes < $1.bytes }
+        }
+    }
+
+    nonisolated static let defaultRepo = "LiquidAI/LFM3-1.7B-GGUF"
+    private static let pairingsKey = "projectorPairings"
+
+    /// Loadable models. Projectors are kept apart: they only work next to their model.
     private(set) var models: [LocalModel] = []
+    private(set) var projectors: [LocalModel] = []
     private(set) var downloads: [String: DownloadState] = [:]
     var lastError: String?
 
@@ -58,26 +78,73 @@ final class ModelStore {
     func refresh() {
         let keys: [URLResourceKey] = [.fileSizeKey]
         let urls = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys)) ?? []
-        models = urls
+        let all = urls
             .filter { $0.pathExtension.lowercased() == "gguf" }
             .map { url in
                 let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
                 return LocalModel(fileName: url.lastPathComponent, url: url, bytes: Int64(size))
             }
             .sorted { $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending }
+        models = all.filter { !$0.fileName.lowercased().contains("mmproj") }
+        projectors = all.filter { $0.fileName.lowercased().contains("mmproj") }
     }
 
     func model(named fileName: String) -> LocalModel? {
         models.first { $0.fileName == fileName }
     }
 
+    /// The projector downloaded with this model, or one whose name matches it
+    /// (mmproj-LFM3-Audio-2B-Q8_0 goes with LFM3-Audio-2B-Q4_0).
+    func projector(for model: LocalModel) -> LocalModel? {
+        if let paired = pairings[model.fileName], let p = projectors.first(where: { $0.fileName == paired }) {
+            return p
+        }
+        let name = model.displayName.lowercased()
+        return projectors.first { p in
+            let base = Self.projectorBase(p.fileName)
+            return !base.isEmpty && (name == base || ["-", "_", "."].contains { name.hasPrefix(base + $0) })
+        }
+    }
+
     func delete(_ model: LocalModel) {
+        let projector = projector(for: model)
         try? FileManager.default.removeItem(at: model.url)
+        pairings[model.fileName] = nil
         refresh()
+        // Drop the projector too, unless another model still uses it.
+        if let projector, !models.contains(where: { self.projector(for: $0) == projector }) {
+            try? FileManager.default.removeItem(at: projector.url)
+            refresh()
+        }
     }
 
     func isDownloaded(_ file: RemoteFile) -> Bool {
-        models.contains { $0.fileName == file.fileName }
+        models.contains { $0.fileName == file.fileName } || projectors.contains { $0.fileName == file.fileName }
+    }
+
+    private var pairings: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: Self.pairingsKey) as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: Self.pairingsKey) }
+    }
+
+    /// "Q4_0" for "LFM3-Audio-2B-Q4_0.gguf": the quantization at the end of a file name.
+    nonisolated static func quantTag(_ fileName: String) -> String? {
+        let stem = (fileName as NSString).deletingPathExtension
+        guard let range = stem.range(of: #"[-_.](i?q[0-9][a-z0-9_]*|bf16|f16|f32)$"#,
+                                     options: [.regularExpression, .caseInsensitive]) else { return nil }
+        return String(stem[range].dropFirst()).uppercased()
+    }
+
+    /// "lfm3-audio-2b" for "mmproj-LFM3-Audio-2B-Q8_0.gguf".
+    nonisolated static func projectorBase(_ fileName: String) -> String {
+        var stem = (fileName as NSString).deletingPathExtension.lowercased()
+        for marker in ["mmproj-", "mmproj_", "-mmproj", "_mmproj", ".mmproj", "mmproj"] {
+            stem = stem.replacingOccurrences(of: marker, with: "")
+        }
+        if let tag = quantTag(stem + ".gguf") {
+            stem = String(stem.dropLast(tag.count + 1))
+        }
+        return stem
     }
 
     /// Memory iOS will still let this app allocate.
@@ -92,7 +159,7 @@ final class ModelStore {
 
     // MARK: - Hugging Face
 
-    func listGGUF(repo input: String) async throws -> [RemoteFile] {
+    func listGGUF(repo input: String) async throws -> Listing {
         let repo = Self.normalizeRepo(input)
         guard repo.split(separator: "/").count == 2,
               let url = URL(string: "https://huggingface.co/api/models/\(repo)/tree/main?recursive=true") else {
@@ -111,13 +178,11 @@ final class ModelStore {
             let size: Int64?
             let lfs: LFS?
         }
-        return try JSONDecoder().decode([Entry].self, from: data)
-            .filter { entry in
-                let lower = entry.path.lowercased()
-                return entry.type == "file" && lower.hasSuffix(".gguf") && !lower.contains("mmproj")
-            }
+        let files = try JSONDecoder().decode([Entry].self, from: data)
+            .filter { $0.type == "file" && $0.path.lowercased().hasSuffix(".gguf") }
             .map { RemoteFile(repo: repo, path: $0.path, bytes: $0.lfs?.size ?? $0.size ?? 0) }
             .sorted { $0.bytes < $1.bytes }
+        return Listing(models: files.filter { !$0.isProjector }, projectors: files.filter(\.isProjector))
     }
 
     static func normalizeRepo(_ input: String) -> String {
@@ -129,16 +194,23 @@ final class ModelStore {
         return parts.count >= 2 ? "\(parts[0])/\(parts[1])" : s
     }
 
-    func download(_ file: RemoteFile) {
+    /// Downloads a model, and its projector when the repo has one, so vision
+    /// and audio models arrive ready to use.
+    func download(_ file: RemoteFile, projector: RemoteFile? = nil) {
         lastError = nil
-        guard downloads[file.fileName] == nil else { return }
-        let needed = file.bytes + 200_000_000
-        if file.bytes > 0 && freeDiskSpace < needed {
+        let files = ([file] + [projector].compactMap { $0 })
+            .filter { !isDownloaded($0) && downloads[$0.fileName] == nil }
+        let bytes = files.reduce(0) { $0 + $1.bytes }
+        let needed = bytes + 200_000_000
+        if bytes > 0 && freeDiskSpace < needed {
             lastError = "Not enough free space for \(file.fileName): it needs \(Format.bytes(needed)), the iPhone has \(Format.bytes(freeDiskSpace)) free."
             return
         }
-        downloads[file.fileName] = DownloadState(received: 0, expected: file.bytes)
-        downloader.start(url: file.downloadURL, fileName: file.fileName)
+        if let projector { pairings[file.fileName] = projector.fileName }
+        for f in files {
+            downloads[f.fileName] = DownloadState(received: 0, expected: f.bytes)
+            downloader.start(url: f.downloadURL, fileName: f.fileName)
+        }
     }
 
     func cancelDownload(_ fileName: String) {

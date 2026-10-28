@@ -10,6 +10,18 @@ struct ModelInfo: Equatable {
     let contextLength: Int
     let chatTemplate: String?
     let addsBOS: Bool
+    /// The mmproj file loaded next to the model, if any.
+    var projector: String?
+    var hearsAudio = false
+    var seesImages = false
+    var speaks = false
+
+    /// What the projector adds to text, e.g. "audio in, speech out".
+    var extras: String {
+        let parts = [seesImages ? "images in" : nil, hearsAudio ? "audio in" : nil, speaks ? "speech out" : nil]
+        let list = parts.compactMap { $0 }
+        return list.isEmpty ? "nothing extra" : list.joined(separator: ", ")
+    }
 }
 
 struct Sampling: Equatable {
@@ -36,6 +48,9 @@ enum EngineError: LocalizedError {
     case notLoaded
     case promptTooLong(tokens: Int, context: Int)
     case decodeFailed(Int32)
+    case projectorFailed(String)
+    case cannotSpeak
+    case speechFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -49,6 +64,12 @@ enum EngineError: LocalizedError {
             return "This chat is \(tokens) tokens, more than the \(context)-token context. Start a new chat or raise the context length in Settings."
         case .decodeFailed(let code):
             return "llama_decode failed with code \(code)."
+        case .projectorFailed(let file):
+            return "Couldn't load the projector \(file). It may be incomplete or belong to another model."
+        case .cannotSpeak:
+            return "The loaded model can't generate speech."
+        case .speechFailed(let step):
+            return "Speech generation failed: \(step)."
         }
     }
 }
@@ -68,6 +89,9 @@ final class LlamaEngine: @unchecked Sendable {
     private var context: OpaquePointer?
     private var vocab: OpaquePointer?
     private var nCtx = 0
+    private var mtmd: OpaquePointer?
+    private var audioGen: OpaquePointer?
+    private var speaks = false
 
     private let cancelLock = NSLock()
     private var cancelled = false
@@ -82,8 +106,8 @@ final class LlamaEngine: @unchecked Sendable {
 
     // MARK: - Public API
 
-    func load(path: String, contextLength: Int) async throws -> ModelInfo {
-        try await onQueue { try self.loadNow(path: path, contextLength: contextLength) }
+    func load(path: String, projector: String?, contextLength: Int) async throws -> ModelInfo {
+        try await onQueue { try self.loadNow(path: path, projector: projector, contextLength: contextLength) }
     }
 
     func unload() async {
@@ -118,6 +142,28 @@ final class LlamaEngine: @unchecked Sendable {
         }
     }
 
+    /// Text to speech. Audio arrives in pieces as it is generated, so playback
+    /// can start before the whole sentence is done.
+    func speak(_ request: SpeechRequest) -> AsyncThrowingStream<SpeechEvent, Error> {
+        setCancelled(false)
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { [weak self] reason in
+                if case .cancelled = reason { self?.cancel() }
+            }
+            queue.async {
+                do {
+                    let stats = try self.speakNow(request) { samples, rate in
+                        continuation.yield(.audio(samples, sampleRate: rate))
+                    }
+                    continuation.yield(.done(stats))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
     // MARK: - Work on the engine queue
 
     private func onQueue<T>(_ body: @escaping () throws -> T) async throws -> T {
@@ -140,7 +186,7 @@ final class LlamaEngine: @unchecked Sendable {
         cancelLock.unlock()
     }
 
-    private func loadNow(path: String, contextLength: Int) throws -> ModelInfo {
+    private func loadNow(path: String, projector: String?, contextLength: Int) throws -> ModelInfo {
         unloadNow()
 
         var modelParams = llama_model_default_params()
@@ -159,15 +205,36 @@ final class LlamaEngine: @unchecked Sendable {
         contextParams.n_ubatch = 512
         contextParams.n_threads = threads
         contextParams.n_threads_batch = threads
+        // Speech generation feeds the model's hidden state to the audio decoder.
+        let projectorCaps = projector.map { mtmd_get_cap_from_file($0) }
+        contextParams.embeddings = projectorCaps?.gen_audio ?? false
         guard let ctx = llama_init_from_model(loaded, contextParams) else {
             llama_model_free(loaded)
             throw EngineError.contextFailed
         }
 
+        var media: OpaquePointer?
+        if let projector {
+            var mediaParams = mtmd_context_params_default()
+            mediaParams.use_gpu = true
+            mediaParams.n_threads = threads
+            mediaParams.print_timings = false
+            mediaParams.warmup = false
+            media = mtmd_init_from_file(projector, loaded, mediaParams)
+            if media == nil {
+                llama_free(ctx)
+                llama_model_free(loaded)
+                throw EngineError.projectorFailed((projector as NSString).lastPathComponent)
+            }
+        }
+        let caps = mtmd_helper_get_capabilities(loaded, media)
+
         model = loaded
         context = ctx
         vocab = llama_model_get_vocab(loaded)
         nCtx = Int(llama_n_ctx(ctx))
+        mtmd = media
+        speaks = caps.audio_gen && contextParams.embeddings
 
         var template: String?
         if let raw = llama_model_chat_template(loaded, nil) {
@@ -182,17 +249,26 @@ final class LlamaEngine: @unchecked Sendable {
             trainContext: trainContext,
             contextLength: nCtx,
             chatTemplate: template,
-            addsBOS: llama_vocab_get_add_bos(vocab)
+            addsBOS: llama_vocab_get_add_bos(vocab),
+            projector: projector.map { ($0 as NSString).lastPathComponent },
+            hearsAudio: caps.audio,
+            seesImages: caps.vision,
+            speaks: speaks
         )
     }
 
     private func unloadNow() {
+        if let audioGen { mtmd_helper_gen_audio_free(audioGen) }
+        if let mtmd { mtmd_free(mtmd) }
         if let context { llama_free(context) }
         if let model { llama_model_free(model) }
+        audioGen = nil
+        mtmd = nil
         context = nil
         model = nil
         vocab = nil
         nCtx = 0
+        speaks = false
     }
 
     private func generateNow(prompt: String, addBOS: Bool, sampling: Sampling, maxTokens: Int, banned: [String],
@@ -211,6 +287,8 @@ final class LlamaEngine: @unchecked Sendable {
         llama_memory_clear(llama_get_memory(ctx), true)
 
         // Only single-token strings (special tags like <think>) can be banned.
+        // A speaking model stays in text here: it must not switch to audio output.
+        let banned = speaks ? banned + ["<|audio_start|>", "<|mixed_start|>"] : banned
         let bannedTokens = banned.compactMap { text -> llama_token? in
             let ids = tokenize(text, vocab: vocab)
             return ids.count == 1 ? ids[0] : nil
@@ -266,6 +344,111 @@ final class LlamaEngine: @unchecked Sendable {
         }
         if !pending.isEmpty { emit(String(decoding: pending, as: UTF8.self)) }
         stats.generationSeconds = Double(DispatchTime.now().uptimeNanoseconds - generationStart) / 1e9
+        return stats
+    }
+
+    private func speakNow(_ request: SpeechRequest, emit: @escaping ([Float], Int) -> Void) throws -> SpeechStats {
+        guard let ctx = context, let vocab, let mtmd else { throw EngineError.notLoaded }
+        guard speaks else { throw EngineError.cannotSpeak }
+        if audioGen == nil { audioGen = mtmd_helper_gen_audio_init(ctx, mtmd) }
+        guard let gen = audioGen else { throw EngineError.speechFailed("the audio decoder didn't start") }
+
+        llama_memory_clear(llama_get_memory(ctx), true)
+
+        let type = mtmd_gen_audio_get_info(mtmd).type
+        // LFM3-Audio is told what to say through its "tts" chat template; other
+        // speech models (Qwen3-TTS, Soprano...) take the plain text.
+        let prompt: String
+        if type == MTMD_GEN_AUDIO_TYPE_LFM3A {
+            let bos = String(cString: llama_vocab_get_text(vocab, llama_vocab_bos(vocab)))
+            prompt = SpeechRequest.lfm3Prompt(request, bos: bos)
+        } else {
+            prompt = request.text
+        }
+
+        var stats = SpeechStats()
+        stats.promptTokens = tokenize(prompt, vocab: vocab).count
+        let start = DispatchTime.now().uptimeNanoseconds
+        func seconds(since t: UInt64) -> Double { Double(DispatchTime.now().uptimeNanoseconds - t) / 1e9 }
+
+        // The C strings have to stay alive while the helper works.
+        let promptC = strdup(prompt), langC = strdup(request.language), voiceC = strdup(request.voice)
+        defer { free(promptC); free(langC); free(voiceC) }
+        var input = mtmd_helper_gen_audio_inp_default()
+        input.stream = true
+        input.seq_id = 0
+        input.prompt = UnsafePointer(promptC)
+        input.prompt_len = strlen(promptC!)
+        input.n_past = 0
+        input.lang = UnsafePointer(langC)
+        input.voice = UnsafePointer(voiceC)
+        input.out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM
+        guard mtmd_helper_gen_audio_set_input(gen, &input) == 0 else {
+            throw EngineError.speechFailed("the model rejected the prompt")
+        }
+
+        let batch = Int32(llama_n_batch(ctx))
+        while true {
+            if isCancelled { stats.stopped = true; return stats }
+            let left = mtmd_helper_gen_audio_step_prompt(gen, batch)
+            if left < 0 { throw EngineError.speechFailed("reading the text") }
+            if left == 0 { break }
+        }
+        let generationStart = DispatchTime.now().uptimeNanoseconds
+        stats.promptSeconds = Double(generationStart - start) / 1e9
+
+        // Audio produced since the last call. In stream mode it has to be read after every frame.
+        func drain() throws {
+            var rate: Int32 = 0
+            var data: UnsafePointer<CChar>?
+            var length = 0
+            var count: Int64 = 0
+            guard mtmd_helper_gen_audio_get_output(gen, &rate, &data, &length, &count) == 0 else {
+                throw EngineError.speechFailed("decoding audio")
+            }
+            stats.sampleRate = Int(rate)
+            let n = length / MemoryLayout<Float>.size
+            guard n > 0, let data else { return }
+            let samples = [Float](unsafeUninitializedCapacity: n) { buffer, initialized in
+                memcpy(buffer.baseAddress!, data, n * MemoryLayout<Float>.size)
+                initialized = n
+            }
+            if stats.firstAudioSeconds == nil { stats.firstAudioSeconds = seconds(since: start) }
+            stats.samples += n
+            emit(samples, Int(rate))
+        }
+
+        // Pipelines with a discrete backbone token (Qwen3-TTS) need one sampled
+        // every frame; LFM3-Audio speaks from the hidden state alone.
+        let sampler = makeSampler(Sampling(temperature: 0.8, topK: 40, topP: 0.95, repeatPenalty: 1), vocab: vocab, banned: [])
+        defer { llama_sampler_free(sampler) }
+        let needsToken = type != MTMD_GEN_AUDIO_TYPE_LFM3A
+
+        let maxFrames = max(0, min(SpeechRequest.maxFrames, nCtx - stats.promptTokens - 16))
+        guard let promptHidden = llama_get_embeddings_ith(ctx, -1) else {
+            throw EngineError.speechFailed("no hidden state after the prompt")
+        }
+        var hidden: UnsafePointer<Float>? = UnsafePointer(promptHidden)
+        while stats.frames < maxFrames {
+            if isCancelled { stats.stopped = true; break }
+            var token: llama_token = -1
+            if needsToken || mtmd_helper_gen_audio_next_is_text(gen) {
+                token = llama_sampler_sample(sampler, ctx, -1)
+            }
+            var next: UnsafePointer<Float>?
+            var stop = false
+            guard mtmd_helper_gen_audio_step_gen(gen, token, hidden, &next, &stop) == 0 else {
+                throw EngineError.speechFailed("frame \(stats.frames + 1)")
+            }
+            try drain()
+            if stop || next == nil { break }
+            stats.frames += 1
+            hidden = next
+        }
+        stats.hitFrameLimit = stats.frames >= maxFrames
+        guard mtmd_helper_gen_audio_flush(gen) == 0 else { throw EngineError.speechFailed("the last frame") }
+        try drain()
+        stats.generationSeconds = seconds(since: generationStart)
         return stats
     }
 

@@ -7,6 +7,7 @@ struct ChatView: View {
     @State private var input = ""
     @State private var showModels = false
     @State private var showSettings = false
+    @State private var showSpeak = false
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -29,7 +30,12 @@ struct ChatView: View {
                     Button { showModels = true } label: { modelTitle }
                         .accessibilityLabel("Models")
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if chat.info?.speaks == true {
+                        Button { showSpeak = true } label: { Image(systemName: "waveform") }
+                            .disabled(chat.isGenerating)
+                            .accessibilityLabel("Speak")
+                    }
                     Button { chat.newChat() } label: { Image(systemName: "square.and.pencil") }
                         .disabled(chat.messages.isEmpty)
                         .accessibilityLabel("New chat")
@@ -37,11 +43,15 @@ struct ChatView: View {
             }
             .sheet(isPresented: $showModels) { ModelsView() }
             .sheet(isPresented: $showSettings) { SettingsView() }
+            .sheet(isPresented: $showSpeak) { SpeakView() }
         }
         .task { await chat.autoload(from: store) }
         .onChange(of: scenePhase) { _, phase in
             // iOS forbids GPU work in the background, so stop before the app leaves the screen.
-            if phase != .active { chat.stop() }
+            if phase != .active {
+                chat.stop()
+                chat.speech.stop()
+            }
         }
     }
 
@@ -163,6 +173,10 @@ private struct EmptyChatView: View {
                     Text(info.name).font(.title3.weight(.semibold))
                     Text("\(Format.params(info.parameterCount)) · \(info.architecture) · \(info.contextLength / 1024)K context")
                         .font(.footnote).foregroundStyle(.secondary)
+                    if info.speaks {
+                        Label("Can speak: tap the waveform button", systemImage: "waveform")
+                            .font(.footnote).foregroundStyle(.tint)
+                    }
                     Text("Runs on this iPhone. Nothing leaves the device.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }

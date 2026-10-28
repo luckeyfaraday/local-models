@@ -29,17 +29,24 @@ final class ChatViewModel {
     private(set) var info: ModelInfo?
     private(set) var loadedFile: String?
 
-    @ObservationIgnored private let engine = LlamaEngine()
+    @ObservationIgnored private let engine: LlamaEngine
+    /// Text to speech, for models that can talk. Shares the loaded model.
+    @ObservationIgnored let speech: SpeechViewModel
     @ObservationIgnored private var builder: PromptBuilder?
     @ObservationIgnored private var loadedContextSetting = 0
     @ObservationIgnored private var generation: Task<Void, Never>?
     @ObservationIgnored private var stopRequested = false
     @ObservationIgnored private var didAutoload = false
 
+    init() {
+        engine = LlamaEngine()
+        speech = SpeechViewModel(engine: engine)
+    }
+
     var isGenerating: Bool { status == .generating }
     var isBusy: Bool {
         if case .loading = status { return true }
-        return status == .generating
+        return status == .generating || speech.isSpeaking
     }
     var supportsThinking: Bool { builder?.supportsThinking ?? false }
 
@@ -56,10 +63,13 @@ final class ChatViewModel {
 
     func load(_ model: ModelStore.LocalModel) async {
         stop()
+        speech.stop()
         status = .loading(model.displayName)
         let contextLength = AppSettings.current.contextLength
+        let projector = ModelStore.shared.projector(for: model)
         do {
-            let info = try await engine.load(path: model.url.path, contextLength: contextLength)
+            let info = try await engine.load(path: model.url.path, projector: projector?.url.path,
+                                             contextLength: contextLength)
             self.info = info
             builder = PromptBuilder(template: info.chatTemplate, vocabAddsBOS: info.addsBOS)
             loadedFile = model.fileName
@@ -77,6 +87,7 @@ final class ChatViewModel {
     func unloadIfDeleted(_ model: ModelStore.LocalModel) async {
         guard loadedFile == model.fileName else { return }
         stop()
+        speech.stop()
         await engine.unload()
         info = nil
         builder = nil

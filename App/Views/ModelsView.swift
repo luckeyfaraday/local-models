@@ -5,7 +5,7 @@ struct ModelsView: View {
     @Environment(ChatViewModel.self) private var chat
     @Environment(\.dismiss) private var dismiss
     @State private var repo = ModelStore.defaultRepo
-    @State private var remote: [ModelStore.RemoteFile] = []
+    @State private var listing = ModelStore.Listing()
     @State private var fetching = false
     @State private var fetchError: String?
 
@@ -22,7 +22,7 @@ struct ModelsView: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
-            .task { if remote.isEmpty { await fetch() } }
+            .task { if listing.models.isEmpty { await fetch() } }
             .refreshable {
                 store.refresh()
                 await fetch()
@@ -46,7 +46,12 @@ struct ModelsView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(model.displayName).foregroundStyle(.primary)
-                            Text(Format.bytes(model.bytes)).font(.caption).foregroundStyle(.secondary)
+                            if let projector = store.projector(for: model) {
+                                Text("\(Format.bytes(model.bytes)) + \(Format.bytes(projector.bytes)) projector")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            } else {
+                                Text(Format.bytes(model.bytes)).font(.caption).foregroundStyle(.secondary)
+                            }
                             if model.bytes > store.availableMemory {
                                 Text("Bigger than the memory iOS gives this app right now (\(Format.bytes(store.availableMemory))).")
                                     .font(.caption).foregroundStyle(.orange)
@@ -109,7 +114,8 @@ struct ModelsView: View {
             if let error = fetchError ?? store.lastError {
                 Text(error).font(.footnote).foregroundStyle(.orange)
             }
-            ForEach(remote) { file in
+            ForEach(listing.models) { file in
+                let projector = listing.bestProjector
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
@@ -122,16 +128,22 @@ struct ModelsView: View {
                                     .foregroundStyle(.tint)
                             }
                         }
-                        Text(Format.bytes(file.bytes)).font(.caption).foregroundStyle(.secondary)
+                        if let projector {
+                            Text("\(Format.bytes(file.bytes)) + \(Format.bytes(projector.bytes)) projector")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text(Format.bytes(file.bytes)).font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     Spacer()
-                    if store.isDownloaded(file) {
+                    let files = [file] + [projector].compactMap { $0 }
+                    if files.allSatisfy({ store.isDownloaded($0) }) {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                             .accessibilityLabel("Downloaded")
-                    } else if store.downloads[file.fileName] != nil {
+                    } else if files.contains(where: { store.downloads[$0.fileName] != nil }) {
                         ProgressView()
                     } else {
-                        Button { store.download(file) } label: {
+                        Button { store.download(file, projector: projector) } label: {
                             Image(systemName: "arrow.down.circle").font(.title3)
                         }
                         .buttonStyle(.borderless)
@@ -142,7 +154,7 @@ struct ModelsView: View {
         } header: {
             Text("Get from Hugging Face")
         } footer: {
-            Text("Any public repo with .gguf files. You can also copy GGUF files into Files › On My iPhone › Local Models.")
+            Text("Any public repo with .gguf files. Vision and audio models also get their projector (mmproj). You can copy GGUF files into Files › On My iPhone › Local Models too.")
         }
     }
 
@@ -164,10 +176,10 @@ struct ModelsView: View {
         fetchError = nil
         defer { fetching = false }
         do {
-            remote = try await store.listGGUF(repo: repo)
-            if remote.isEmpty { fetchError = "No .gguf files in \(ModelStore.normalizeRepo(repo))." }
+            listing = try await store.listGGUF(repo: repo)
+            if listing.models.isEmpty { fetchError = "No .gguf files in \(ModelStore.normalizeRepo(repo))." }
         } catch {
-            remote = []
+            listing = ModelStore.Listing()
             fetchError = error.localizedDescription
         }
     }

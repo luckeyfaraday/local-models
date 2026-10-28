@@ -56,6 +56,10 @@ struct SettingsView: View {
                         LabeledContent("Architecture", value: info.architecture)
                         LabeledContent("Size", value: "\(Format.params(info.parameterCount)) · \(Format.bytes(Int64(info.sizeBytes)))")
                         LabeledContent("Trained context", value: "\(info.trainContext / 1024)K")
+                        if let projector = info.projector {
+                            LabeledContent("Projector", value: projector)
+                            LabeledContent("Also does", value: info.extras)
+                        }
                     }
                     LabeledContent("llama.cpp", value: Bundle.main.object(forInfoDictionaryKey: "LlamaBuild") as? String ?? "?")
                     LabeledContent("App", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")

@@ -38,6 +38,8 @@ enum SettingKey {
     static let maxTokens = "maxTokens"
     static let systemPrompt = "systemPrompt"
     static let lastModel = "lastModel"
+    static let speechVoice = "speechVoice"
+    static let speechLanguage = "speechLanguage"
 }
 
 struct AppSettings {
