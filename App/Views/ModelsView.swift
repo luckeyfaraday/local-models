@@ -140,7 +140,8 @@ struct ModelsView: View {
                     if files.allSatisfy({ store.isDownloaded($0) }) {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                             .accessibilityLabel("Downloaded")
-                    } else if files.contains(where: { store.downloads[$0.fileName] != nil }) {
+                    } else if store.downloads[file.fileName] != nil
+                                || (store.isDownloaded(file) && files.contains(where: { store.downloads[$0.fileName] != nil })) {
                         ProgressView()
                     } else {
                         Button { store.download(file, projector: projector) } label: {

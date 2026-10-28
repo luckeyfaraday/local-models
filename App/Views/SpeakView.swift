@@ -44,6 +44,9 @@ struct SpeakView: View {
                     }
                     if speech.canReplay {
                         Button { speech.replay() } label: { Label("Play again", systemImage: "play.fill") }
+                        if let file = speech.audioFile {
+                            ShareLink(item: file) { Label("Share audio", systemImage: "square.and.arrow.up") }
+                        }
                     }
                 }
                 results

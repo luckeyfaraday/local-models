@@ -37,6 +37,9 @@ final class SpeechViewModel {
         self.engine = engine
     }
 
+    /// The last result as a WAV file, for sharing.
+    private(set) var audioFile: URL?
+
     var isSpeaking: Bool { state == .speaking }
     var canReplay: Bool { !samples.isEmpty && !isSpeaking }
 
@@ -49,6 +52,7 @@ final class SpeechViewModel {
         gapSeconds = 0
         bufferNeeded = 0
         samples = []
+        audioFile = nil
         muted = false
         thermalAtStart = ProcessInfo.processInfo.thermalState
         UIApplication.shared.isIdleTimerDisabled = true
@@ -90,6 +94,7 @@ final class SpeechViewModel {
                     }
                 }
                 state = .done
+                audioFile = saveWAV()
             } catch {
                 state = .failed(error.localizedDescription)
             }
@@ -101,6 +106,17 @@ final class SpeechViewModel {
         muted = true
         if isSpeaking { engine.cancel() }
         player.stop()
+    }
+
+    private func saveWAV() -> URL? {
+        guard !samples.isEmpty, sampleRate > 0 else { return nil }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("Local Models speech.wav")
+        do {
+            try WAV.encode(samples, sampleRate: sampleRate).write(to: url)
+            return url
+        } catch {
+            return nil
+        }
     }
 
     func replay() {
