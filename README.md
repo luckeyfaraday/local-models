@@ -13,6 +13,14 @@ pinned llama.cpp build supports, including models released yesterday.
 The default suggestion is Liquid AI's [LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF)
 (about 1 GB at Q4_0), which needs llama.cpp `b11960` or newer.
 
+Measured on an iPhone 13 Pro (A15) with `LFM3-1.7B-QAD-Q4_0`: about **24 tokens/sec** while
+writing, and a few hundred prompt tokens read in well under a second. Once the phone runs hot
+(after minutes of reasoning, or while charging), speed drops to about 19 tok/s.
+
+Reasoning starts **off**. With it on, LFM3-1.7B often thinks for 2,000–3,000 tokens (2+ minutes on
+the phone) even for simple questions. With it off, the app also bans the `<think>` token, because
+the model sometimes opens a reasoning block anyway.
+
 ## Install
 
 There's no App Store build. CI builds an **unsigned** IPA; you sign it with your own Apple ID.
