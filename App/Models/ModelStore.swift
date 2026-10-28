@@ -80,7 +80,7 @@ final class ModelStore {
         let urls = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys)) ?? []
         let all = urls
             .filter { $0.pathExtension.lowercased() == "gguf" }
-            .map { url in
+            .map { url -> LocalModel in
                 let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
                 return LocalModel(fileName: url.lastPathComponent, url: url, bytes: Int64(size))
             }
