@@ -35,7 +35,7 @@ struct MessageRow: View {
                 } label: {
                     HStack(spacing: 6) {
                         if !reply.thinkingDone && isStreaming { ProgressView().controlSize(.mini) }
-                        Text(reply.thinkingDone ? "Thoughts" : "Thinking…")
+                        Text(thinkingLabel(thinking, done: reply.thinkingDone))
                     }
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
@@ -72,6 +72,12 @@ struct MessageRow: View {
         if message.stopped { parts.append("stopped") }
         if stats.hitContextLimit { parts.append("context full") }
         return parts.joined(separator: " · ")
+    }
+
+    private func thinkingLabel(_ thinking: String, done: Bool) -> String {
+        let words = thinking.split(whereSeparator: \.isWhitespace).count
+        let count = words == 0 ? "" : " · \(words) words"
+        return (done ? "Thoughts" : "Thinking…") + count
     }
 
     private func markdown(_ text: String) -> AttributedString {

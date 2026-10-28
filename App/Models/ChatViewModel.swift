@@ -33,6 +33,7 @@ final class ChatViewModel {
     @ObservationIgnored private var builder: PromptBuilder?
     @ObservationIgnored private var loadedContextSetting = 0
     @ObservationIgnored private var generation: Task<Void, Never>?
+    @ObservationIgnored private var stopRequested = false
     @ObservationIgnored private var didAutoload = false
 
     var isGenerating: Bool { status == .generating }
@@ -110,26 +111,45 @@ final class ChatViewModel {
             let id = reply.id
             messages.append(reply)
             status = .generating
+            stopRequested = false
             UIApplication.shared.isIdleTimerDisabled = true
             defer {
                 UIApplication.shared.isIdleTimerDisabled = false
                 if status == .generating { status = .ready }
+                generation = nil
+            }
+
+            // Redrawing a long reply on every token costs more than generating it,
+            // so text reaches the screen at most every 50 ms.
+            var pending = ""
+            var lastFlush = Date.distantPast
+            func flush() {
+                guard !pending.isEmpty, let i = messages.firstIndex(where: { $0.id == id }) else { return }
+                messages[i].raw += pending
+                pending = ""
+                lastFlush = Date()
             }
 
             do {
                 let stream = engine.generate(prompt: prompt.text, addBOS: builder.addBOS,
                                              sampling: settings.preset.sampling, maxTokens: settings.maxTokens)
                 for try await event in stream {
-                    guard let i = messages.firstIndex(where: { $0.id == id }) else { break }
+                    guard messages.contains(where: { $0.id == id }) else { break }
                     switch event {
-                    case .text(let piece): messages[i].raw += piece
-                    case .done(let stats): messages[i].stats = stats
+                    case .text(let piece):
+                        pending += piece
+                        if Date().timeIntervalSince(lastFlush) >= 0.05 { flush() }
+                    case .done(let stats):
+                        flush()
+                        if let i = messages.firstIndex(where: { $0.id == id }) { messages[i].stats = stats }
                     }
                 }
-                if Task.isCancelled, let i = messages.firstIndex(where: { $0.id == id }) {
+                flush()
+                if stopRequested, let i = messages.firstIndex(where: { $0.id == id }) {
                     messages[i].stopped = true
                 }
             } catch {
+                flush()
                 if let i = messages.firstIndex(where: { $0.id == id }) {
                     messages[i].error = error.localizedDescription
                 }
@@ -137,10 +157,12 @@ final class ChatViewModel {
         }
     }
 
+    /// Ends the reply at the next token. The stream still finishes normally,
+    /// so the stopped message keeps its tokens/sec.
     func stop() {
+        guard generation != nil else { return }
+        stopRequested = true
         engine.cancel()
-        generation?.cancel()
-        generation = nil
     }
 
     func newChat() {

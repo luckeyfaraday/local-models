@@ -3,7 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(ChatViewModel.self) private var chat
     @Environment(\.dismiss) private var dismiss
-    @AppStorage(SettingKey.thinking) private var thinking = true
+    @AppStorage(SettingKey.thinking) private var thinking = false
     @AppStorage(SettingKey.contextLength) private var contextLength = 8192
     @AppStorage(SettingKey.preset) private var preset = SamplingPreset.general.rawValue
     @AppStorage(SettingKey.maxTokens) private var maxTokens = 4096
@@ -16,7 +16,7 @@ struct SettingsView: View {
                     Toggle("Think before answering", isOn: $thinking)
                 } footer: {
                     Text(chat.supportsThinking || chat.info == nil
-                         ? "Reasoning models write their thoughts first. Better answers, slower replies."
+                         ? "Reasoning models write their thoughts first. Better on hard problems, but a small model can think for minutes before it answers."
                          : "The loaded model doesn't have a reasoning mode.")
                 }
 

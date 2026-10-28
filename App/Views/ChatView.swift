@@ -63,7 +63,9 @@ struct ChatView: View {
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
+                // Not lazy: a reasoning block can be dozens of screens tall, which
+                // breaks LazyVStack's height estimate and scrolls into blank space.
+                VStack(alignment: .leading, spacing: 18) {
                     ForEach(chat.messages) { message in
                         MessageRow(message: message, isStreaming: chat.isGenerating && message.id == chat.messages.last?.id)
                             .id(message.id)

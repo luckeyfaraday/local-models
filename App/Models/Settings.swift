@@ -51,7 +51,7 @@ struct AppSettings {
 
     static func register() {
         UserDefaults.standard.register(defaults: [
-            SettingKey.thinking: true,
+            SettingKey.thinking: false,
             SettingKey.contextLength: 8192,
             SettingKey.preset: SamplingPreset.general.rawValue,
             SettingKey.maxTokens: 4096,
