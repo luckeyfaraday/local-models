@@ -40,6 +40,7 @@ enum SettingKey {
     static let lastModel = "lastModel"
     static let speechVoice = "speechVoice"
     static let speechLanguage = "speechLanguage"
+    static let speechText = "speechText"
 }
 
 struct AppSettings {

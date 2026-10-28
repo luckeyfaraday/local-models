@@ -152,10 +152,19 @@ final class LlamaEngine: @unchecked Sendable {
             }
             queue.async {
                 do {
-                    let stats = try self.speakNow(request) { samples, rate in
-                        continuation.yield(.audio(samples, sampleRate: rate))
+                    var stats: SpeechStats?
+                    let chunks = request.chunks
+                    for chunk in chunks {
+                        var part = request
+                        part.text = chunk
+                        let partStats = try self.speakNow(part) { samples, rate in
+                            continuation.yield(.audio(samples, sampleRate: rate))
+                        }
+                        if stats == nil { stats = partStats } else { stats!.append(partStats) }
+                        if partStats.stopped || self.isCancelled { break }
                     }
-                    continuation.yield(.done(stats))
+                    stats?.chunks = chunks.count
+                    continuation.yield(.done(stats ?? SpeechStats()))
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)

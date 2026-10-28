@@ -7,7 +7,7 @@ struct SpeakView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SettingKey.speechVoice) private var voice = "female"
     @AppStorage(SettingKey.speechLanguage) private var language = "en"
-    @State private var text = SpeechRequest.sample
+    @AppStorage(SettingKey.speechText) private var text = SpeechRequest.sample
     @FocusState private var editing: Bool
 
     private var speech: SpeechViewModel { chat.speech }
@@ -92,7 +92,8 @@ struct SpeakView: View {
                     LabeledContent("Audio", value: "\(seconds(s.audioSeconds)) made in \(seconds(s.totalSeconds))")
                     LabeledContent("First sound after", value: s.firstAudioSeconds.map(seconds) ?? "–")
                     LabeledContent("Frames", value: String(format: "%ld at %.1f/s (speech needs 12.5/s)", s.frames, s.framesPerSecond))
-                    LabeledContent("Text read", value: "\(s.promptTokens) tokens in \(seconds(s.promptSeconds))")
+                    LabeledContent("Text read", value: "\(s.promptTokens) tokens in \(seconds(s.promptSeconds))"
+                                   + (s.chunks > 1 ? ", \(s.chunks) pieces" : ""))
                     LabeledContent("Gaps while playing", value: speech.gaps == 0 ? "none" : "\(speech.gaps), \(seconds(speech.gapSeconds)) in all")
                     LabeledContent("Buffer for no gaps", value: seconds(speech.bufferNeeded))
                     LabeledContent("Phone temperature", value: thermal(speech.thermalAtStart))
