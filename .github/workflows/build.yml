@@ -1,0 +1,62 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch llama.cpp
+        run: |
+          scripts/fetch-llama.sh
+          echo "LLAMA_TAG=$(cut -d' ' -f1 LLAMA_VERSION)" >> "$GITHUB_ENV"
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          xcodebuild -version
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild -project LocalModels.xcodeproj -target LocalModels -configuration Release \
+            -sdk iphoneos SYMROOT="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build > build.log 2>&1 || { grep -E "error:" build.log | sort -u | head -60; tail -20 build.log; exit 1; }
+          grep -E "\.swift:[0-9]+:[0-9]+: warning:" build.log | sort -u | head -40 || true
+
+      - name: Package IPA
+        run: |
+          app=build/Release-iphoneos/LocalModels.app
+          test -f "$app/Frameworks/llama.framework/llama"
+          mkdir -p dist/Payload
+          cp -R "$app" dist/Payload/
+          (cd dist && zip -qry LocalModels-unsigned.ipa Payload)
+          ls -lh dist/LocalModels-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalModels-unsigned-ipa
+          path: dist/LocalModels-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/LocalModels-unsigned.ipa --title "$GITHUB_REF_NAME" --generate-notes
