@@ -8,6 +8,11 @@ pinned llama.cpp build supports, including models released yesterday.
   Files › On My iPhone › Local Models.
 - Streaming chat with tokens/sec, reasoning on/off for thinking models (LFM3, Qwen-style),
   sampling presets, context length and a system prompt.
+- **Talk** with [LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF) (model + its
+  `mmproj` projector): tap the mic, speak, tap again. The model answers out loud with its own
+  voice-chat mode (one generation interleaving text and speech, as llama-server's `/v1/realtime`
+  does), and the text shows alongside. English only.
+- **Speak**: text to speech with the same model.
 - Nothing leaves the phone except the model download.
 
 The default suggestion is Liquid AI's [LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF)
@@ -16,6 +21,10 @@ The default suggestion is Liquid AI's [LFM3-1.7B](https://huggingface.co/LiquidA
 Measured on an iPhone 13 Pro (A15) with `LFM3-1.7B-QAD-Q4_0`: about **24 tokens/sec** while
 writing, and a few hundred prompt tokens read in well under a second. Once the phone runs hot
 (after minutes of reasoning, or while charging), speed drops to about 19 tok/s.
+
+Talking to LFM3-Audio-2B (Q4_0 + mmproj Q8_0) on the same phone: speech is made at about **1.0× real
+time**, the first sound comes **~1.5 s** after you stop speaking (a bit more with the playback
+buffer that keeps longer replies from stuttering), and replies of 10–17 s came out clean.
 
 Reasoning starts **off**. With it on, LFM3-1.7B often thinks for 2,000–3,000 tokens (2+ minutes on
 the phone) even for simple questions. With it off, the app also bans the `<think>` token, because
@@ -60,7 +69,8 @@ Tagging `v*` attaches the IPA to a release. On a Mac you can run the same steps 
   going.
 - Every turn re-reads the whole chat, since hybrid models such as LFM can't trim part of their
   state. Prefill is fast on the GPU, but very long chats get slower to start.
-- Text only for now: no vision, audio or tool calling.
+- No vision or tool calling. Voice needs LFM3-Audio; each voice turn re-reads the conversation as
+  text (the user's earlier turns as the model's own transcripts).
 
 ## License
 

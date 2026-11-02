@@ -40,9 +40,12 @@ final class VoiceViewModel {
     var isBusy: Bool { phase == .starting || phase == .replying || transcribing }
 
     /// Speech held back before playback starts. While the model writes, text
-    /// tokens and audio frames take turns (6 and 12), and the text blocks make
-    /// a little less than real time, so playback starts slightly behind.
-    static let preroll = 0.6
+    /// tokens and audio frames take turns (6 and 12): each block makes 0.96 s
+    /// of speech in about 1.05 s on an iPhone 13 Pro, so playback falls ~0.09 s
+    /// behind per block until the text is done. One block of audio up front
+    /// covers replies of about 60 text tokens; with 0.6 s a 61-token reply ran
+    /// dry 6 times.
+    static let preroll = 0.96
 
     @ObservationIgnored private let engine: LlamaEngine
     @ObservationIgnored private let audio = VoiceAudio()
