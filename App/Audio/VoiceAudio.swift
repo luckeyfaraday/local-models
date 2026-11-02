@@ -11,7 +11,7 @@ enum MicEvent: Sendable {
 
 /// The detector's view of the reply's echo, for the log.
 struct EchoStats: Equatable {
-    var peakAboveFloor: Float = -100
+    var peak: Float = -100
     var longestRun = 0.0
     var floor: Float = 0
 }
@@ -46,11 +46,25 @@ final class VoiceAudio: @unchecked Sendable {
             self.outputRate = outputRate
             configured = true
         }
+        sink.resetBuffers()
         if !engine.isRunning {
             engine.prepare()
             try engine.start()
         }
         player.play()
+    }
+
+    /// Whether mic buffers arrived since the last start.
+    var hearsInput: Bool { sink.buffers > 0 }
+
+    /// Stops and starts again. On an iPhone 13 Pro the first start after voice
+    /// processing is turned on sometimes leaves the mic silent (no buffers at
+    /// all) until the engine is restarted.
+    func restart() throws {
+        player.stop()
+        engine.stop()
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        try start(outputRate: outputRate)
     }
 
     func stop() {
@@ -90,6 +104,14 @@ final class VoiceAudio: @unchecked Sendable {
 
     /// The echo numbers since the reply started playing.
     func echoStats() -> EchoStats { sink.echoStats() }
+
+    /// Debug: every detector frame's level (time, dBFS, reply playing) since the last call.
+    var tracing: Bool {
+        get { sink.tracing }
+        set { sink.tracing = newValue }
+    }
+
+    func takeTrace() -> [(time: Double, level: Float, echo: Bool)] { sink.takeTrace() }
 
     // MARK: Playback
 
@@ -164,7 +186,33 @@ final class VoiceAudio: @unchecked Sendable {
         private let lock = NSLock()
         private var samples: [Float] = []
         private var on = false
+        private var count = 0
         var rate = 48000.0
+        private var traceOn = false
+        private var trace: [(time: Double, level: Float, echo: Bool)] = []
+
+        var tracing: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return traceOn }
+            set { lock.lock(); traceOn = newValue; trace.removeAll(); lock.unlock() }
+        }
+
+        func takeTrace() -> [(time: Double, level: Float, echo: Bool)] {
+            lock.lock()
+            defer { trace.removeAll(); lock.unlock() }
+            return trace
+        }
+
+        var buffers: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return count
+        }
+
+        func resetBuffers() {
+            lock.lock()
+            count = 0
+            lock.unlock()
+        }
 
         private var handler: (@MainActor @Sendable (MicEvent) -> Void)?
         private var detector = VoiceDetector()
@@ -205,7 +253,7 @@ final class VoiceAudio: @unchecked Sendable {
         func echoStats() -> EchoStats {
             lock.lock()
             defer { lock.unlock() }
-            return EchoStats(peakAboveFloor: detector.echoPeak, longestRun: detector.echoLongestRun, floor: detector.floor)
+            return EchoStats(peak: detector.echoPeak, longestRun: detector.echoLongestRun, floor: detector.floor)
         }
 
         func begin() {
@@ -227,6 +275,7 @@ final class VoiceAudio: @unchecked Sendable {
                 guard let channel = buffer.floatChannelData?[0] else { return }
                 let input = UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength))
                 lock.lock()
+                count += 1
                 if on { samples.append(contentsOf: input) }
                 var events: [MicEvent] = []
                 let handler = self.handler
@@ -241,6 +290,8 @@ final class VoiceAudio: @unchecked Sendable {
         /// Runs under the lock: 20 ms frames through the detector.
         private func detect(_ input: UnsafeBufferPointer<Float>, into events: inout [MicEvent]) {
             let frameLength = max(1, Int(rate * VoiceDetector.frameSeconds))
+            // The buffer's last sample arrives about now.
+            let bufferEnd = Date().timeIntervalSince1970
             var i = 0
             while i < input.count {
                 let n = min(frameLength - frame.count, input.count - i)
@@ -251,6 +302,9 @@ final class VoiceAudio: @unchecked Sendable {
                 var meanSquare: Float = 0
                 vDSP_measqv(frame, 1, &meanSquare, vDSP_Length(frameLength))
                 let db = 10 * log10(meanSquare + 1e-12)
+                if traceOn && trace.count < 60_000 {
+                    trace.append((bufferEnd - Double(input.count - i) / rate, db, echoOn))
+                }
                 let wasInSpeech = detector.inSpeech
                 let event = detector.process(level: db, echo: echoOn)
                 if wasInSpeech || event == .started {

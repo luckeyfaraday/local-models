@@ -24,8 +24,11 @@ struct VoiceDetector {
     static let margin: Float = 10
     /// Extra while the reply plays, so what voice processing leaves of its echo doesn't count.
     static let echoMargin: Float = 8
-    /// Quieter than this (dBFS) is never speech.
+    /// Quieter than this (dBFS) is never speech. Voice processing suppresses
+    /// noise to about -100 dBFS between sounds, so this is usually the threshold.
     static let minLevel: Float = -55
+    /// The same while the reply plays: its echo leaks through in short bursts.
+    static let echoMinLevel: Float = -40
 
     private(set) var floor: Float = -60
     private(set) var inSpeech = false
@@ -35,8 +38,8 @@ struct VoiceDetector {
     private var quiet = 0.0
     private var turn = 0.0
 
-    /// While the reply plays: how far the loudest frame got above the floor,
-    /// and the longest run over the interrupt threshold (it fires at startSeconds).
+    /// While the reply plays: the loudest frame (dBFS), and the longest
+    /// unbroken run over the interrupt threshold (it fires at startSeconds).
     private(set) var echoPeak: Float = -100
     private(set) var echoLongestRun = 0.0
     private var echoRun = 0.0
@@ -56,10 +59,12 @@ struct VoiceDetector {
             floor = calibrationSum / Float(calibrated / frame)
             return nil
         }
-        let threshold = max(floor + Self.margin + (echo ? Self.echoMargin : 0), Self.minLevel)
+        let threshold = echo
+            ? max(floor + Self.margin + Self.echoMargin, Self.echoMinLevel)
+            : max(floor + Self.margin, Self.minLevel)
         let loud = db > threshold
         if echo {
-            echoPeak = max(echoPeak, db - floor)
+            echoPeak = max(echoPeak, db)
             echoRun = loud ? echoRun + frame : 0
             echoLongestRun = max(echoLongestRun, echoRun)
         }
@@ -70,7 +75,8 @@ struct VoiceDetector {
                 quiet = 0
             } else {
                 quiet += frame
-                if quiet >= Self.blipGapSeconds { voiced = 0 }
+                // Over the reply, the speech has to be unbroken: echo comes in bursts.
+                if echo || quiet >= Self.blipGapSeconds { voiced = 0 }
                 // Down fast, up slowly (about 1 dB/s), only from frames that aren't speech.
                 floor += (db < floor ? 0.2 : 0.005) * (db - floor)
             }

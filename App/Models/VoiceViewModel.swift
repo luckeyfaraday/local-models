@@ -145,6 +145,8 @@ final class VoiceViewModel {
                     return
                 }
                 guard handsFree else { return }
+                // Debug builds of the test kit also keep the detector's levels.
+                audio.tracing = !Self.testFiles.isEmpty
                 audio.listen { [weak self] event in self?.heard(event) }
             }
         } else {
@@ -238,6 +240,12 @@ final class VoiceViewModel {
         do {
             try audio.start(outputRate: info.audioOutputRate)
             audioRunning = true
+            // A silent mic (no buffers yet) is restarted, at most twice.
+            for _ in 0..<2 {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                if audio.hearsInput { break }
+                try audio.restart()
+            }
             return true
         } catch {
             phase = .failed(error.localizedDescription)
@@ -447,10 +455,16 @@ final class VoiceViewModel {
             "firstSoundSeconds": e.firstSound ?? -1, "preroll": Self.preroll, "gaps": e.gaps, "gapSeconds": e.gapSeconds,
             "stopped": s.stopped, "hitLimit": s.hitLimit, "thermal": thermal.rawValue,
             "handsFree": handsFree, "interrupted": e.interrupted, "playedSeconds": e.playedSeconds ?? -1,
-            "echoPeakAboveFloorDB": Double(echo.peakAboveFloor), "echoLongestRunSeconds": echo.longestRun,
+            "echoPeakDBFS": Double(echo.peak), "echoLongestRunSeconds": echo.longestRun,
             "noiseFloorDB": Double(echo.floor),
+            "playbackStartEpoch": playback.started ? playback.startedAt.timeIntervalSince1970 : -1,
         ]
         if let error = e.error { line["error"] = error }
+        if audio.tracing {
+            let rows = audio.takeTrace().map { String(format: "%.3f,%.1f,%d", $0.time, $0.level, $0.echo ? 1 : 0) }
+            try? (["time,db,echo"] + rows).joined(separator: "\n").write(
+                to: folder.appendingPathComponent("turn-\(e.number)-levels.csv"), atomically: true, encoding: .utf8)
+        }
         guard var data = try? JSONSerialization.data(withJSONObject: line, options: [.sortedKeys]) else { return }
         data.append(0x0A)
         let log = folder.appendingPathComponent("log.txt")
