@@ -29,6 +29,12 @@ struct VoiceDetector {
     static let minLevel: Float = -55
     /// The same while the reply plays: its echo leaks through in short bursts.
     static let echoMinLevel: Float = -40
+    /// Over the reply, voice processing chops the user's speech into bursts
+    /// (double talk): gaps up to 60 ms (3 frames) don't break it. Measured on
+    /// an iPhone 13 Pro: a question played over a reply got 0.26 s unbroken
+    /// above -40 dBFS, 0.52 s with these gaps; 2 minutes of replies with room
+    /// sound never got 0.3 s.
+    static let echoGapSeconds = 0.07
 
     private(set) var floor: Float = -60
     private(set) var inSpeech = false
@@ -75,8 +81,7 @@ struct VoiceDetector {
                 quiet = 0
             } else {
                 quiet += frame
-                // Over the reply, the speech has to be unbroken: echo comes in bursts.
-                if echo || quiet >= Self.blipGapSeconds { voiced = 0 }
+                if echo ? quiet > Self.echoGapSeconds : quiet >= Self.blipGapSeconds { voiced = 0 }
                 // Down fast, up slowly (about 1 dB/s), only from frames that aren't speech.
                 floor += (db < floor ? 0.2 : 0.005) * (db - floor)
             }
