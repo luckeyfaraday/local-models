@@ -32,6 +32,8 @@ final class ChatViewModel {
     @ObservationIgnored private let engine: LlamaEngine
     /// Text to speech, for models that can talk. Shares the loaded model.
     @ObservationIgnored let speech: SpeechViewModel
+    /// Spoken conversation, for models that hear and speak (LFM3-Audio).
+    @ObservationIgnored let voice: VoiceViewModel
     @ObservationIgnored private var builder: PromptBuilder?
     @ObservationIgnored private var loadedContextSetting = 0
     @ObservationIgnored private var generation: Task<Void, Never>?
@@ -41,12 +43,13 @@ final class ChatViewModel {
     init() {
         engine = LlamaEngine()
         speech = SpeechViewModel(engine: engine)
+        voice = VoiceViewModel(engine: engine)
     }
 
     var isGenerating: Bool { status == .generating }
     var isBusy: Bool {
         if case .loading = status { return true }
-        return status == .generating || speech.isSpeaking
+        return status == .generating || speech.isSpeaking || voice.isBusy
     }
     var supportsThinking: Bool { builder?.supportsThinking ?? false }
 
@@ -64,6 +67,7 @@ final class ChatViewModel {
     func load(_ model: ModelStore.LocalModel) async {
         stop()
         speech.stop()
+        voice.close()
         status = .loading(model.displayName)
         let contextLength = AppSettings.current.contextLength
         let projector = ModelStore.shared.projector(for: model)
@@ -88,6 +92,7 @@ final class ChatViewModel {
         guard loadedFile == model.fileName else { return }
         stop()
         speech.stop()
+        voice.close()
         await engine.unload()
         info = nil
         builder = nil

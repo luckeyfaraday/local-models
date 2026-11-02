@@ -37,6 +37,7 @@ targets:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         ITSAppUsesNonExemptEncryption: false
+        NSMicrophoneUsageDescription: Local Models listens while you talk to a model that understands speech. The audio stays on this iPhone.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.luckeyfaraday.localmodels

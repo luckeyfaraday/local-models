@@ -15,6 +15,11 @@ struct ModelInfo: Equatable {
     var hearsAudio = false
     var seesImages = false
     var speaks = false
+    /// Spoken conversation: audio in, interleaved text and speech out (LFM3-Audio).
+    var talks = false
+    /// Sample rates of the audio the projector hears and speaks, in Hz.
+    var audioInputRate = 16000
+    var audioOutputRate = 24000
 
     /// What the projector adds to text, e.g. "audio in, speech out".
     var extras: String {
@@ -51,6 +56,8 @@ enum EngineError: LocalizedError {
     case projectorFailed(String)
     case cannotSpeak
     case speechFailed(String)
+    case cannotTalk
+    case voiceFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -70,6 +77,10 @@ enum EngineError: LocalizedError {
             return "The loaded model can't generate speech."
         case .speechFailed(let step):
             return "Speech generation failed: \(step)."
+        case .cannotTalk:
+            return "The loaded model can't hold a spoken conversation."
+        case .voiceFailed(let step):
+            return "The voice reply failed: \(step)."
         }
     }
 }
@@ -92,6 +103,7 @@ final class LlamaEngine: @unchecked Sendable {
     private var mtmd: OpaquePointer?
     private var audioGen: OpaquePointer?
     private var speaks = false
+    private var talks = false
 
     private let cancelLock = NSLock()
     private var cancelled = false
@@ -173,6 +185,43 @@ final class LlamaEngine: @unchecked Sendable {
         }
     }
 
+    /// One turn of a spoken conversation: the user's audio (mono PCM at the
+    /// projector's rate) after the earlier turns, answered with text and speech
+    /// interleaved in one generation. Both stream out as they are made.
+    func voiceReply(history: [VoiceExchangeText], audio: [Float]) -> AsyncThrowingStream<VoiceEvent, Error> {
+        setCancelled(false)
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { [weak self] reason in
+                if case .cancelled = reason { self?.cancel() }
+            }
+            queue.async {
+                do {
+                    let prefix = VoicePrompt.chat(history: history, bos: self.bosText())
+                    let stats = try self.respondNow(prefix: prefix, audio: audio, mode: MTMD_HELPER_GEN_AUDIO_OUT_MIXED,
+                                                    maxSteps: VoicePrompt.maxSteps,
+                                                    onText: { continuation.yield(.text($0)) },
+                                                    onAudio: { continuation.yield(.audio($0, sampleRate: $1)) })
+                    continuation.yield(.done(stats))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// The words of a clip, transcribed by the same model.
+    func transcribe(_ audio: [Float], language: String = "en") async throws -> String {
+        setCancelled(false)
+        return try await onQueue { () throws -> String in
+            var text = ""
+            _ = try self.respondNow(prefix: VoicePrompt.asr(language: language, bos: self.bosText()), audio: audio,
+                                    mode: MTMD_HELPER_GEN_AUDIO_OUT_TEXT, maxSteps: 400,
+                                    onText: { text += $0 }, onAudio: { _, _ in })
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
     // MARK: - Work on the engine queue
 
     private func onQueue<T>(_ body: @escaping () throws -> T) async throws -> T {
@@ -244,6 +293,13 @@ final class LlamaEngine: @unchecked Sendable {
         nCtx = Int(llama_n_ctx(ctx))
         mtmd = media
         speaks = caps.audio_gen && contextParams.embeddings
+        // Voice chat mirrors llama-server's /v1/realtime: audio goes in through
+        // the audio stream, the reply comes from the LFM3-Audio gen pipeline.
+        talks = speaks && caps.audio && media.map {
+            mtmd_support_audio_stream($0) && mtmd_gen_audio_get_info($0).type == MTMD_GEN_AUDIO_TYPE_LFM3A
+        } == true
+        let audioInputRate = media.map { Int(mtmd_get_audio_sample_rate($0)) } ?? 0
+        let audioOutputRate = speaks ? media.map { Int(mtmd_gen_audio_get_info($0).sample_rate) } ?? 0 : 0
 
         var template: String?
         if let raw = llama_model_chat_template(loaded, nil) {
@@ -262,7 +318,10 @@ final class LlamaEngine: @unchecked Sendable {
             projector: projector.map { ($0 as NSString).lastPathComponent },
             hearsAudio: caps.audio,
             seesImages: caps.vision,
-            speaks: speaks
+            speaks: speaks,
+            talks: talks,
+            audioInputRate: audioInputRate > 0 ? audioInputRate : 16000,
+            audioOutputRate: audioOutputRate > 0 ? audioOutputRate : 24000
         )
     }
 
@@ -278,6 +337,7 @@ final class LlamaEngine: @unchecked Sendable {
         vocab = nil
         nCtx = 0
         speaks = false
+        talks = false
     }
 
     private func generateNow(prompt: String, addBOS: Bool, sampling: Sampling, maxTokens: Int, banned: [String],
@@ -461,12 +521,212 @@ final class LlamaEngine: @unchecked Sendable {
         return stats
     }
 
+    /// A turn the way llama-server's realtime slot runs it: the text before the
+    /// audio as tokens, the audio as embedding rows from the audio stream, then
+    /// the gen-audio pipeline continues the sequence in `mode` and follows the
+    /// model's switching between text tokens and audio frames.
+    private func respondNow(prefix: String, audio: [Float], mode: mtmd_helper_gen_audio_out_mode, maxSteps: Int,
+                            onText: @escaping (String) -> Void,
+                            onAudio: @escaping ([Float], Int) -> Void) throws -> VoiceStats {
+        guard let ctx = context, let vocab, let mtmd, let model else { throw EngineError.notLoaded }
+        guard talks else { throw EngineError.cannotTalk }
+        if audioGen == nil { audioGen = mtmd_helper_gen_audio_init(ctx, mtmd) }
+        guard let gen = audioGen else { throw EngineError.voiceFailed("the audio decoder didn't start") }
+
+        var stats = VoiceStats()
+        let start = DispatchTime.now().uptimeNanoseconds
+        func seconds(since t: UInt64) -> Double { Double(DispatchTime.now().uptimeNanoseconds - t) / 1e9 }
+
+        // Every turn re-reads the conversation (earlier turns are text): the
+        // hybrid memory can't drop part of itself, and transcription in between
+        // uses the same sequence.
+        llama_memory_clear(llama_get_memory(ctx), true)
+        var nPast: Int32 = 0
+        let header = tokenize(prefix, vocab: vocab)
+        try header.withUnsafeBufferPointer { buffer in
+            try decode(ctx, model: model, tokens: buffer.baseAddress, rows: nil, count: Int32(buffer.count), at: &nPast)
+        }
+
+        guard let stream = mtmd_audio_stream_init(mtmd, mtmd_audio_stream_params_default()) else {
+            throw EngineError.voiceFailed("the audio encoder didn't start")
+        }
+        defer { mtmd_audio_stream_free(stream) }
+        _ = audio.withUnsafeBufferPointer { mtmd_audio_stream_push(stream, $0.baseAddress, $0.count) }
+        stats.audioRows += try decodeAudioRows(stream, ctx: ctx, model: model, at: &nPast)
+        _ = mtmd_audio_stream_flush(stream, true)
+        stats.audioRows += try decodeAudioRows(stream, ctx: ctx, model: model, at: &nPast)
+
+        // The C string has to stay alive while the helper reads the prompt.
+        let openC = strdup(VoicePrompt.replyOpen)
+        defer { free(openC) }
+        var input = mtmd_helper_gen_audio_inp_default()
+        input.stream = true
+        input.seq_id = 0
+        input.prompt = UnsafePointer(openC)
+        input.prompt_len = strlen(openC!)
+        input.n_past = nPast
+        input.out_mode = mode
+        input.out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM
+        guard mtmd_helper_gen_audio_set_input(gen, &input) == 0 else {
+            throw EngineError.voiceFailed("the model rejected the conversation")
+        }
+        // The pipeline may bias text tokens, e.g. no switch to audio in a text-only reply.
+        var nBias = 0
+        var biases: [llama_logit_bias] = []
+        if let bias = mtmd_helper_gen_audio_get_logit_bias(gen, &nBias), nBias > 0 {
+            biases = Array(UnsafeBufferPointer(start: bias, count: nBias))
+        }
+        let batch = Int32(llama_n_batch(ctx))
+        while true {
+            if isCancelled { stats.stopped = true; return stats }
+            let left = mtmd_helper_gen_audio_step_prompt(gen, batch)
+            if left < 0 { throw EngineError.voiceFailed("reading the conversation") }
+            if left == 0 { break }
+        }
+        stats.promptTokens = Int(nPast) + tokenize(VoicePrompt.replyOpen, vocab: vocab).count
+        stats.promptSeconds = seconds(since: start)
+        let generationStart = DispatchTime.now().uptimeNanoseconds
+
+        // Text is greedy, as the GGUF says (top_k 1, temp 0); the pipeline
+        // samples the audio codes with the model's own settings.
+        let sampler = makeSampler(Sampling(temperature: 0, topK: 0, topP: 1, repeatPenalty: 1), vocab: vocab,
+                                  banned: [], biases: biases)
+        defer { llama_sampler_free(sampler) }
+
+        let nEmbd = Int(llama_model_n_embd(model))
+        guard let promptHidden = llama_get_embeddings_ith(ctx, -1) else {
+            throw EngineError.voiceFailed("no hidden state after the prompt")
+        }
+        var hidden = Array(UnsafeBufferPointer(start: promptHidden, count: nEmbd))
+
+        func drain() throws {
+            var rate: Int32 = 0
+            var data: UnsafePointer<CChar>?
+            var length = 0
+            var count: Int64 = 0
+            guard mtmd_helper_gen_audio_get_output(gen, &rate, &data, &length, &count) == 0 else {
+                throw EngineError.voiceFailed("decoding audio")
+            }
+            stats.sampleRate = Int(rate)
+            let n = length / MemoryLayout<Float>.size
+            guard n > 0, let data else { return }
+            let samples = [Float](unsafeUninitializedCapacity: n) { buffer, initialized in
+                memcpy(buffer.baseAddress!, data, n * MemoryLayout<Float>.size)
+                initialized = n
+            }
+            if stats.firstAudioSeconds == nil { stats.firstAudioSeconds = seconds(since: start) }
+            stats.samples += n
+            onAudio(samples, Int(rate))
+        }
+
+        var pending: [UInt8] = []
+        var steps = 0
+        while true {
+            if isCancelled { stats.stopped = true; break }
+            if steps >= maxSteps { stats.hitLimit = true; break }
+            // The reply ends before the context is full.
+            if Int(llama_memory_seq_pos_max(llama_get_memory(ctx), 0)) + 2 >= nCtx { stats.hitLimit = true; break }
+
+            let isText = mtmd_helper_gen_audio_next_is_text(gen)
+            let token: llama_token = isText ? llama_sampler_sample(sampler, ctx, -1) : -1
+            var next: UnsafePointer<Float>?
+            var stop = false
+            let rc = hidden.withUnsafeBufferPointer { h in
+                mtmd_helper_gen_audio_step_gen(gen, token, h.baseAddress, &next, &stop)
+            }
+            guard rc == 0 else { throw EngineError.voiceFailed("step \(steps + 1)") }
+            steps += 1
+            if isText {
+                if !stop {
+                    stats.textTokens += 1
+                    // Control tokens (<|text_end|>...) stay out of the text, as in llama-server.
+                    if !llama_vocab_is_control(vocab, token) {
+                        pending += piece(token, vocab: vocab)
+                        if let text = String(bytes: pending, encoding: .utf8) {
+                            if stats.firstTextSeconds == nil { stats.firstTextSeconds = seconds(since: start) }
+                            onText(text)
+                            pending.removeAll()
+                        } else if pending.count > 16 {
+                            onText(String(decoding: pending, as: UTF8.self))
+                            pending.removeAll()
+                        }
+                    }
+                }
+            } else {
+                stats.frames += 1
+            }
+            try drain()
+            if stop { break }
+            if let next { hidden.withUnsafeMutableBufferPointer { _ = memcpy($0.baseAddress!, next, nEmbd * MemoryLayout<Float>.size) } }
+        }
+        if !pending.isEmpty { onText(String(decoding: pending, as: UTF8.self)) }
+        guard mtmd_helper_gen_audio_flush(gen) == 0 else { throw EngineError.voiceFailed("the last frame") }
+        try drain()
+        stats.generationSeconds = seconds(since: generationStart)
+        return stats
+    }
+
+    /// Appends tokens or embedding rows to sequence 0 at explicit positions,
+    /// like the realtime slot of llama-server. No logits are asked for.
+    private func decode(_ ctx: OpaquePointer, model: OpaquePointer, tokens: UnsafePointer<llama_token>?,
+                        rows: UnsafePointer<Float>?, count n: Int32, at nPast: inout Int32) throws {
+        guard n > 0 else { return }
+        if Int(nPast + n) >= nCtx { throw EngineError.promptTooLong(tokens: Int(nPast + n), context: nCtx) }
+        let nEmbd = Int(llama_model_n_embd_inp(model))
+        let nBatch = Int32(llama_n_batch(ctx))
+        var i0: Int32 = 0
+        while i0 < n {
+            let nCur = min(nBatch, n - i0)
+            var batch = llama_batch_init(nCur, rows != nil ? Int32(nEmbd) : 0, 1)
+            for i in 0..<Int(nCur) {
+                let src = Int(i0) + i
+                if let rows {
+                    memcpy(batch.embd!.advanced(by: i * nEmbd), rows.advanced(by: src * nEmbd), nEmbd * MemoryLayout<Float>.size)
+                } else if let tokens {
+                    batch.token![i] = tokens[src]
+                }
+                batch.pos![i] = nPast + i0 + Int32(i)
+                batch.n_seq_id![i] = 1
+                batch.seq_id![i]![0] = 0
+                batch.logits![i] = 0
+            }
+            batch.n_tokens = nCur
+            let rc = llama_decode(ctx, batch)
+            llama_batch_free(batch)
+            if rc != 0 { throw EngineError.decodeFailed(rc) }
+            i0 += nCur
+        }
+        nPast += n
+    }
+
+    /// Decodes the rows the audio stream has ready. Returns how many.
+    private func decodeAudioRows(_ stream: OpaquePointer, ctx: OpaquePointer, model: OpaquePointer,
+                                 at nPast: inout Int32) throws -> Int {
+        var total = 0
+        while true {
+            let n = mtmd_audio_stream_step(stream, -1)
+            if n == -2 { throw EngineError.voiceFailed("encoding the audio") }
+            if n <= 0 { return total }
+            guard let rows = mtmd_audio_stream_get_output_embd(stream) else {
+                throw EngineError.voiceFailed("encoding the audio")
+            }
+            try decode(ctx, model: model, tokens: nil, rows: rows, count: n, at: &nPast)
+            total += Int(n)
+        }
+    }
+
+    private func bosText() -> String {
+        guard let vocab else { return "" }
+        return String(cString: llama_vocab_get_text(vocab, llama_vocab_bos(vocab)))
+    }
+
     // MARK: - Helpers
 
-    private func makeSampler(_ s: Sampling, vocab: OpaquePointer, banned: [llama_token]) -> UnsafeMutablePointer<llama_sampler> {
+    private func makeSampler(_ s: Sampling, vocab: OpaquePointer, banned: [llama_token],
+                             biases extra: [llama_logit_bias] = []) -> UnsafeMutablePointer<llama_sampler> {
         let chain = llama_sampler_chain_init(llama_sampler_chain_default_params())!
-        if !banned.isEmpty {
-            let biases = banned.map { llama_logit_bias(token: $0, bias: -Float.infinity) }
+        let biases = banned.map { llama_logit_bias(token: $0, bias: -Float.infinity) } + extra
+        if !biases.isEmpty {
             llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), Int32(biases.count), biases))
         }
         if s.repeatPenalty != 1 {
