@@ -44,7 +44,7 @@ struct VoiceView: View {
             Spacer()
             Image(systemName: "bubble.left.and.text.bubble.right").font(.system(size: 44)).foregroundStyle(.tint)
             Text("Talk with \(chat.info?.name ?? "the model")").font(.title3.weight(.semibold))
-            Text("Tap the microphone, speak, and tap again. It answers out loud. English only.")
+            Text("Tap the microphone, speak, and tap again. Or turn on hands-free and just talk; speak over a reply to interrupt it. English only.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
             Spacer()
@@ -77,6 +77,12 @@ struct VoiceView: View {
 
     private var controls: some View {
         VStack(spacing: 10) {
+            Toggle(isOn: handsFreeBinding) {
+                Label("Hands-free", systemImage: "phone")
+            }
+            .disabled(!canTalk)
+            .padding(.bottom, 2)
+
             Button {
                 if let info = chat.info { voice.talk(info) }
             } label: {
@@ -106,6 +112,12 @@ struct VoiceView: View {
         .background(.bar)
     }
 
+    private var handsFreeBinding: Binding<Bool> {
+        Binding(get: { voice.handsFree }, set: { on in
+            if let info = chat.info { voice.setHandsFree(on, info: info) }
+        })
+    }
+
     private var canTalk: Bool {
         guard chat.info?.talks == true else { return false }
         if case .loading = chat.status { return false }
@@ -113,6 +125,14 @@ struct VoiceView: View {
     }
 
     private var buttonIcon: String {
+        if voice.handsFree {
+            switch voice.callState {
+            case .listening: return "ear"
+            case .hearing: return "waveform"
+            case .thinking: return "ellipsis"
+            case .speaking: return "stop.fill"
+            }
+        }
         switch voice.phase {
         case .listening: return "arrow.up"
         case .replying: return "stop.fill"
@@ -122,10 +142,18 @@ struct VoiceView: View {
 
     private var buttonColor: Color {
         guard canTalk else { return Color(.systemGray3) }
+        if voice.handsFree { return voice.callState == .hearing ? .red : .accentColor }
         return voice.phase == .listening ? .red : .accentColor
     }
 
     private var buttonLabel: String {
+        if voice.handsFree {
+            switch voice.callState {
+            case .listening: return "Listening"
+            case .hearing: return "Hearing you"
+            case .thinking, .speaking: return "Stop"
+            }
+        }
         switch voice.phase {
         case .listening: return "Send"
         case .replying: return "Stop"
@@ -135,6 +163,15 @@ struct VoiceView: View {
 
     private var caption: String {
         if chat.info?.talks != true { return "Load LFM3-Audio with its projector to talk." }
+        if voice.handsFree, voice.phase != .starting {
+            if case .failed(let message) = voice.phase { return message }
+            switch voice.callState {
+            case .listening: return "Listening…"
+            case .hearing: return "Hearing you…"
+            case .thinking: return "Thinking…"
+            case .speaking: return "Speaking · talk to interrupt"
+            }
+        }
         switch voice.phase {
         case .idle: return voice.exchanges.isEmpty ? "Tap to talk" : "Tap to answer"
         case .starting: return "Starting the microphone…"
@@ -197,7 +234,11 @@ private struct ExchangeRow: View {
         if let first = exchange.firstSound { parts.append(String(format: "first sound %.1f s", first)) }
         parts.append(String(format: "%.1f s of speech at %.2f× real time", s.audioSeconds, s.realTimeFactor))
         parts.append(exchange.gaps == 0 ? "no gaps" : String(format: "%d gaps (%.1f s)", exchange.gaps, exchange.gapSeconds))
-        if s.stopped { parts.append("stopped") }
+        if exchange.interrupted {
+            parts.append(String(format: "interrupted after %.1f s", exchange.playedSeconds ?? 0))
+        } else if s.stopped {
+            parts.append("stopped")
+        }
         if s.hitLimit { parts.append("cut at the length limit") }
         return parts.joined(separator: " · ")
     }

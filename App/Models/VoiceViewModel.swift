@@ -3,10 +3,12 @@ import Foundation
 import Observation
 import UIKit
 
-/// A spoken conversation with the loaded model: tap to talk, tap again to
-/// send. The model answers with speech and text from one generation (its
-/// voice-chat mode), and both play and show as they are made. The user's
-/// words are transcribed after each reply, for the screen and the next turn.
+/// A spoken conversation with the loaded model. Push to talk: tap to talk,
+/// tap again to send. Hands-free: the mic stays open, a turn ends after a
+/// short silence, and talking over a reply stops it. The model answers with
+/// speech and text from one generation (its voice-chat mode), and both play
+/// and show as they are made. The user's words are transcribed after each
+/// reply, for the screen and the next turn.
 @Observable @MainActor
 final class VoiceViewModel {
     enum Phase: Equatable {
@@ -15,6 +17,14 @@ final class VoiceViewModel {
         case listening
         case replying
         case failed(String)
+    }
+
+    /// What a hands-free call is doing, for the screen.
+    enum CallState: Equatable {
+        case listening
+        case hearing
+        case thinking
+        case speaking
     }
 
     struct Exchange: Identifiable, Equatable {
@@ -30,14 +40,30 @@ final class VoiceViewModel {
         /// Times playback ran dry waiting for audio, and for how long in all.
         var gaps = 0
         var gapSeconds = 0.0
+        /// Talked over: only the part that was heard stays in the reply.
+        var interrupted = false
+        var playedSeconds: Double?
         var error: String?
     }
 
     private(set) var exchanges: [Exchange] = []
     private(set) var phase: Phase = .idle
     private(set) var transcribing = false
+    /// Hands-free: the mic stays open and the detector takes the turns.
+    private(set) var handsFree = false
+    /// The detector hears speech.
+    private(set) var hearing = false
+    /// The reply is playing.
+    private(set) var speaking = false
 
     var isBusy: Bool { phase == .starting || phase == .replying || transcribing }
+
+    var callState: CallState {
+        if hearing { return .hearing }
+        if speaking { return .speaking }
+        if phase == .replying { return .thinking }
+        return .listening
+    }
 
     /// Speech held back before playback starts. While the model writes, text
     /// tokens and audio frames take turns (6 and 12): each block makes 0.96 s
@@ -47,13 +73,22 @@ final class VoiceViewModel {
     /// dry 6 times.
     static let preroll = 0.96
 
+    /// Seconds of speech per text token in LFM3-Audio's replies (0.26–0.27 s
+    /// measured on long ones): maps how much of an interrupted reply was heard
+    /// to its text. The text runs ahead of the speech, so it can't be cut by
+    /// what has been written.
+    static let secondsPerToken = 0.27
+
     @ObservationIgnored private let engine: LlamaEngine
     @ObservationIgnored private let audio = VoiceAudio()
     @ObservationIgnored private var audioRunning = false
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var playback = Playback()
+    /// The exchange whose reply may play: audio of an older one is dropped.
+    @ObservationIgnored private var currentTurn: UUID?
     /// Set by stop(): frames still in flight must not restart the sound.
     @ObservationIgnored private var muted = false
+    @ObservationIgnored private var handsFreeInfo: ModelInfo?
     @ObservationIgnored private var testIndex = 0
 
     private struct Playback {
@@ -62,6 +97,7 @@ final class VoiceViewModel {
         var started = false
         var startedAt = Date.distantPast
         var ends = Date.distantPast
+        var scheduledSeconds = 0.0
         var gaps = 0
         var gapSeconds = 0.0
         var all: [Float] = []
@@ -73,8 +109,13 @@ final class VoiceViewModel {
 
     // MARK: - Actions
 
-    /// The mic button: listen, send what was heard, or stop the reply.
+    /// The mic button: listen, send what was heard, or stop the reply. In
+    /// hands-free it only stops the reply.
     func talk(_ info: ModelInfo) {
+        if handsFree {
+            if phase == .replying || speaking { interrupt() }
+            return
+        }
         switch phase {
         case .listening:
             let samples = audio.endRecording(rate: info.audioInputRate)
@@ -83,6 +124,34 @@ final class VoiceViewModel {
             stop()
         case .idle, .failed:
             listen(info)
+        }
+    }
+
+    func setHandsFree(_ on: Bool, info: ModelInfo) {
+        guard on != handsFree else { return }
+        if on {
+            if phase == .listening {
+                _ = audio.endRecording(rate: info.audioInputRate)
+                phase = .idle
+            }
+            if case .failed = phase { phase = .idle }
+            handsFree = true
+            handsFreeInfo = info
+            // Like a call: the screen stays on.
+            UIApplication.shared.isIdleTimerDisabled = true
+            Task {
+                guard await prepare(info) else {
+                    handsFree = false
+                    return
+                }
+                guard handsFree else { return }
+                audio.listen { [weak self] event in self?.heard(event) }
+            }
+        } else {
+            handsFree = false
+            hearing = false
+            audio.listen(nil)
+            if !isBusy { UIApplication.shared.isIdleTimerDisabled = false }
         }
     }
 
@@ -110,6 +179,8 @@ final class VoiceViewModel {
         muted = true
         if phase == .replying || phase == .starting { engine.cancel() }
         audio.silence()
+        speaking = false
+        audio.replyPlaying = false
         if phase == .listening { _ = audio.endRecording(rate: 16000) }
         if phase != .replying { phase = .idle }
     }
@@ -117,13 +188,15 @@ final class VoiceViewModel {
     func newConversation() {
         stop()
         task?.cancel()
+        currentTurn = nil
         exchanges.removeAll()
         try? FileManager.default.removeItem(at: Self.outputFolder)
         phase = .idle
     }
 
-    /// Leaving the screen: stop and give the audio session back.
+    /// Leaving the screen: stop, hang up and give the audio session back.
     func close() {
+        if let info = handsFreeInfo { setHandsFree(false, info: info) }
         stop()
         if audioRunning {
             audio.stop()
@@ -172,44 +245,79 @@ final class VoiceViewModel {
         }
     }
 
+    /// The hands-free detector: a turn begins (or talks over the reply), or ends.
+    private func heard(_ event: MicEvent) {
+        guard handsFree, let info = handsFreeInfo else { return }
+        switch event {
+        case .speechStarted:
+            hearing = true
+            if phase == .replying || speaking { interrupt() }
+        case .turnEnded(let samples, let rate):
+            hearing = false
+            reply(to: VoiceAudio.resample(samples, from: rate, to: Double(info.audioInputRate)), info: info, source: "hands-free")
+        }
+    }
+
+    /// Talked over: stop generating and playing at once. The part that was
+    /// heard stays in the conversation (the turn's task trims the text).
+    private func interrupt() {
+        guard let id = currentTurn else { return }
+        let played = playedSeconds()
+        update(id) {
+            $0.interrupted = true
+            $0.playedSeconds = played
+        }
+        muted = true
+        if phase == .replying { engine.cancel() }
+        audio.silence()
+        speaking = false
+        audio.replyPlaying = false
+    }
+
     private func reply(to samples: [Float], info: ModelInfo, source: String) {
         let heardSeconds = Double(samples.count) / Double(info.audioInputRate)
         guard heardSeconds >= 0.3 else {
-            phase = .idle
+            if phase != .replying { phase = .idle }
             return
         }
         let number = (exchanges.last?.number ?? 0) + 1
         let exchange = Exchange(number: number, heardSeconds: heardSeconds)
         let id = exchange.id
         exchanges.append(exchange)
+        currentTurn = id
         phase = .replying
-        muted = false
-        playback = Playback(rate: info.audioOutputRate)
         let turnStart = Date()
         let thermal = ProcessInfo.processInfo.thermalState
+        let handsFreeTurn = handsFree
         UIApplication.shared.isIdleTimerDisabled = true
 
-        // The previous turn may still be transcribing; its words go into this one.
+        // The previous turn may still be finishing (transcribing, trimming an
+        // interrupted reply); its words go into this one.
         let previous = task
         task = Task {
             await previous?.value
-            defer { UIApplication.shared.isIdleTimerDisabled = false }
+            defer { UIApplication.shared.isIdleTimerDisabled = handsFree }
+            guard currentTurn == id else { return }
+            muted = false
+            playback = Playback(rate: info.audioOutputRate)
             let history = exchanges.compactMap { e -> VoiceExchangeText? in
                 guard e.id != id, let heard = e.heard, !heard.isEmpty, !e.reply.isEmpty else { return nil }
                 return VoiceExchangeText(heard: heard, reply: e.reply)
             }
+            var pieces: [String] = []
             do {
                 for try await event in engine.voiceReply(history: history, audio: samples) {
                     switch event {
                     case .text(let piece):
+                        pieces.append(piece)
                         update(id) { $0.reply += piece }
                     case .audio(let chunk, let rate):
-                        received(chunk, rate: rate)
+                        received(chunk, rate: rate, turn: id)
                     case .done(let stats):
                         update(id) { $0.stats = stats }
                     }
                 }
-                startPlayback()
+                startPlayback(turn: id)
             } catch {
                 update(id) { $0.error = error.localizedDescription }
             }
@@ -221,13 +329,22 @@ final class VoiceViewModel {
                 $0.gaps = gaps
                 $0.gapSeconds = gapSeconds
             }
-            if phase == .replying { phase = .idle }
+            if phase == .replying && currentTurn == id { phase = .idle }
+            let playing = Task { await finishPlayback(turn: id) }
 
             transcribing = true
             let heard = try? await engine.transcribe(samples)
             transcribing = false
             update(id) { $0.heard = heard ?? "" }
-            save(id, question: samples, inputRate: info.audioInputRate, source: source, thermal: thermal)
+
+            let echo = await playing.value
+            update(id) {
+                if $0.interrupted, let played = $0.playedSeconds {
+                    $0.reply = Self.heardPart(of: pieces, seconds: played)
+                }
+            }
+            save(id, question: samples, inputRate: info.audioInputRate, source: source, thermal: thermal,
+                 handsFree: handsFreeTurn, echo: echo)
         }
     }
 
@@ -236,26 +353,39 @@ final class VoiceViewModel {
         change(&exchanges[i])
     }
 
+    /// The text of the first `seconds` of a reply, to the last whole word.
+    private static func heardPart(of pieces: [String], seconds: Double) -> String {
+        let n = Int((seconds / secondsPerToken).rounded())
+        guard n > 0 else { return "" }
+        var text = pieces.prefix(n).joined()
+        if n < pieces.count, let space = text.lastIndex(where: \.isWhitespace) {
+            text = String(text[..<space])
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     // MARK: - Playback
 
-    private func received(_ chunk: [Float], rate: Int) {
-        guard !muted else { return }
+    private func received(_ chunk: [Float], rate: Int, turn: UUID) {
+        guard !muted, turn == currentTurn else { return }
         playback.rate = rate
         playback.all += chunk
         if playback.started {
             schedule(chunk)
         } else {
             playback.pending += chunk
-            if Double(playback.pending.count) / Double(rate) >= Self.preroll { startPlayback() }
+            if Double(playback.pending.count) / Double(rate) >= Self.preroll { startPlayback(turn: turn) }
         }
     }
 
-    private func startPlayback() {
-        guard !playback.started, !playback.pending.isEmpty, !muted else { return }
+    private func startPlayback(turn: UUID) {
+        guard !playback.started, !playback.pending.isEmpty, !muted, turn == currentTurn else { return }
         let now = Date()
         playback.started = true
         playback.startedAt = now
         playback.ends = now
+        speaking = true
+        audio.replyPlaying = true
         schedule(playback.pending)
         playback.pending = []
     }
@@ -267,13 +397,39 @@ final class VoiceViewModel {
             playback.gaps += 1
             playback.gapSeconds += late
         }
-        playback.ends = max(playback.ends, now) + Double(chunk.count) / Double(playback.rate)
+        let seconds = Double(chunk.count) / Double(playback.rate)
+        playback.ends = max(playback.ends, now) + seconds
+        playback.scheduledSeconds += seconds
         audio.enqueue(chunk)
+    }
+
+    /// How much of the current reply has been played.
+    private func playedSeconds() -> Double {
+        guard playback.started else { return 0 }
+        return max(0, playback.scheduledSeconds - max(0, playback.ends.timeIntervalSinceNow))
+    }
+
+    /// Waits for the reply to finish playing (or be cut), then listens with
+    /// the normal threshold again. Returns what the detector made of the echo.
+    private func finishPlayback(turn: UUID) async -> EchoStats {
+        while playback.started, !muted, currentTurn == turn {
+            // A little past the end: the speaker still rings for a moment.
+            let left = playback.ends.timeIntervalSinceNow + 0.3
+            if left <= 0 { break }
+            try? await Task.sleep(nanoseconds: UInt64(left * 1e9))
+        }
+        let echo = audio.echoStats()
+        if currentTurn == turn {
+            speaking = false
+            audio.replyPlaying = false
+        }
+        return echo
     }
 
     // MARK: - Files
 
-    private func save(_ id: UUID, question: [Float], inputRate: Int, source: String, thermal: ProcessInfo.ThermalState) {
+    private func save(_ id: UUID, question: [Float], inputRate: Int, source: String, thermal: ProcessInfo.ThermalState,
+                      handsFree: Bool, echo: EchoStats) {
         guard let e = exchanges.first(where: { $0.id == id }) else { return }
         let folder = Self.outputFolder
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -290,6 +446,9 @@ final class VoiceViewModel {
             "firstTextSeconds": s.firstTextSeconds ?? -1, "firstAudioSeconds": s.firstAudioSeconds ?? -1,
             "firstSoundSeconds": e.firstSound ?? -1, "preroll": Self.preroll, "gaps": e.gaps, "gapSeconds": e.gapSeconds,
             "stopped": s.stopped, "hitLimit": s.hitLimit, "thermal": thermal.rawValue,
+            "handsFree": handsFree, "interrupted": e.interrupted, "playedSeconds": e.playedSeconds ?? -1,
+            "echoPeakAboveFloorDB": Double(echo.peakAboveFloor), "echoLongestRunSeconds": echo.longestRun,
+            "noiseFloorDB": Double(echo.floor),
         ]
         if let error = e.error { line["error"] = error }
         guard var data = try? JSONSerialization.data(withJSONObject: line, options: [.sortedKeys]) else { return }

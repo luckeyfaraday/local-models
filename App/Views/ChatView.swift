@@ -60,6 +60,8 @@ struct ChatView: View {
                 chat.speech.stop()
                 chat.voice.stop()
             }
+            // The mic can't stay open in the background: hang up.
+            if phase == .background { chat.voice.close() }
         }
     }
 
