@@ -15,6 +15,8 @@ struct ChatView: View {
     @State private var showPhotos = false
     @State private var photoItem: PhotosPickerItem?
     @State private var imageError: String?
+    /// The chat follows a streaming reply only while its end is on screen.
+    @State private var atBottom = true
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -24,6 +26,7 @@ struct ChatView: View {
                     EmptyChatView(showModels: $showModels)
                 } else {
                     messageList
+                    if case .failed(let message) = chat.status { failureBanner(message) }
                 }
                 inputBar
             }
@@ -72,14 +75,9 @@ struct ChatView: View {
         }
         .task { await chat.autoload(from: store) }
         .onChange(of: scenePhase) { _, phase in
-            // iOS forbids GPU work in the background, so stop before the app leaves the screen.
-            if phase != .active {
-                chat.stop()
-                chat.speech.stop()
-                chat.voice.stop()
-            }
-            // The mic can't stay open in the background: hang up.
-            if phase == .background { chat.voice.close() }
+            // Inactive (Control Center, an alert, the app switcher) leaves a reply
+            // running. The background doesn't allow GPU work or an open mic.
+            if phase == .background { chat.enterBackground() }
         }
     }
 
@@ -98,29 +96,58 @@ struct ChatView: View {
         }
     }
 
+    /// A load that failed with a chat on screen (the context length changed, say).
+    private func failureBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+            Text(message).font(.footnote).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Models") { showModels = true }.font(.footnote.weight(.semibold))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color(.secondarySystemBackground))
+    }
+
     private var messageList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                // Not lazy: a reasoning block can be dozens of screens tall, which
-                // breaks LazyVStack's height estimate and scrolls into blank space.
-                VStack(alignment: .leading, spacing: 18) {
-                    ForEach(chat.messages) { message in
-                        MessageRow(message: message, isStreaming: chat.isGenerating && message.id == chat.messages.last?.id)
-                            .id(message.id)
-                    }
-                    Color.clear.frame(height: 1).id("bottom")
+        GeometryReader { viewport in
+            ScrollViewReader { proxy in
+                messageScroll(proxy: proxy, height: viewport.size.height)
+            }
+        }
+    }
+
+    private func messageScroll(proxy: ScrollViewProxy, height: CGFloat) -> some View {
+        ScrollView {
+            // Not lazy: a reasoning block can be dozens of screens tall, which
+            // breaks LazyVStack's height estimate and scrolls into blank space.
+            VStack(alignment: .leading, spacing: 18) {
+                ForEach(chat.messages) { message in
+                    MessageRow(message: message, isStreaming: chat.isGenerating && message.id == chat.messages.last?.id)
+                        .id(message.id)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
+                Color.clear.frame(height: 1).id("bottom")
+                    .background {
+                        GeometryReader { marker in
+                            // Within a few lines of the end counts: one flush of a
+                            // streaming reply adds less than that.
+                            let near = marker.frame(in: .named("chat")).maxY <= height + 80
+                            Color.clear.onChange(of: near, initial: true) { _, near in atBottom = near }
+                        }
+                    }
             }
-            .defaultScrollAnchor(.bottom)
-            .scrollDismissesKeyboard(.interactively)
-            .onChange(of: chat.messages.last?.raw) { _, _ in
-                proxy.scrollTo("bottom", anchor: .bottom)
-            }
-            .onChange(of: chat.messages.count) { _, _ in
-                withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
-            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+        .coordinateSpace(.named("chat"))
+        .defaultScrollAnchor(.bottom)
+        .scrollDismissesKeyboard(.interactively)
+        .onChange(of: chat.messages.last?.raw) { _, _ in
+            // Scrolled up to read: the reply keeps streaming below, out of the way.
+            if atBottom { proxy.scrollTo("bottom", anchor: .bottom) }
+        }
+        .onChange(of: chat.messages.count) { _, _ in
+            withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
         }
     }
 

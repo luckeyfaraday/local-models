@@ -24,12 +24,7 @@ struct SpeechRequest: Equatable {
             if !sentence.isEmpty { sentences.append(sentence) }
             return true
         }
-        // A very long sentence is split where it pauses: after a comma, semicolon or colon.
-        let pieces = sentences.flatMap { sentence -> [String] in
-            guard Self.words(sentence) > Self.longSentenceWords else { return [sentence] }
-            return sentence.replacingOccurrences(of: #"([,;:])\s+"#, with: "$1\n", options: .regularExpression)
-                .split(separator: "\n").map(String.init)
-        }
+        let pieces = sentences.flatMap(Self.split)
         var chunks: [String] = []
         var current = ""
         for piece in pieces {
@@ -44,8 +39,61 @@ struct SpeechRequest: Equatable {
         return chunks.isEmpty ? [text] : chunks
     }
 
-    private static func words(_ s: String) -> Int {
-        s.split(whereSeparator: \.isWhitespace).count
+    /// A very long sentence is split where it pauses: after a comma, semicolon
+    /// or colon. A stretch with no pause in it is cut every `chunkWords` words.
+    static func split(_ sentence: String) -> [String] {
+        guard words(sentence) > longSentenceWords else { return [sentence] }
+        return sentence
+            .replacingOccurrences(of: #"([,;:])\s+|([、，；：])\s*"#, with: "$1$2\n", options: .regularExpression)
+            .split(separator: "\n")
+            .flatMap { part in words(String(part)) > longSentenceWords ? cut(String(part)) : [String(part)] }
+    }
+
+    /// The length of a text in spoken words. Chinese and Japanese are written
+    /// without spaces, so there each character counts: about 0.7 of a word, by
+    /// how long it takes to say.
+    static func words(_ s: String) -> Int {
+        var tenths = 0
+        var inWord = false
+        for character in s {
+            if character.isWhitespace {
+                inWord = false
+            } else if isUnspaced(character) {
+                tenths += 7
+                inWord = false
+            } else if !inWord && !character.isPunctuation && !character.isSymbol {
+                tenths += 10
+                inWord = true
+            }
+        }
+        return (tenths + 9) / 10
+    }
+
+    /// Cuts a text with no pauses into pieces of about `chunkWords` words:
+    /// between words, or between characters where there are no spaces.
+    private static func cut(_ text: String) -> [String] {
+        var parts: [String] = []
+        var current = ""
+        func close() {
+            let part = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !part.isEmpty { parts.append(part) }
+            current = ""
+        }
+        for character in text {
+            if (character.isWhitespace || isUnspaced(character)) && words(current) >= chunkWords { close() }
+            current.append(character)
+        }
+        close()
+        return parts
+    }
+
+    /// Han, hiragana and katakana: scripts written without spaces between words.
+    private static func isUnspaced(_ character: Character) -> Bool {
+        guard let scalar = character.unicodeScalars.first?.value else { return false }
+        switch scalar {
+        case 0x3040...0x30FF, 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xF900...0xFAFF, 0x20000...0x2FA1F: return true
+        default: return false
+        }
     }
 
     static let sample = "Hi! I'm a language model running entirely on this iPhone. Nothing you say to me leaves the phone, and I don't need an internet connection to talk back."

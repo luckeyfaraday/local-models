@@ -40,6 +40,7 @@ final class ChatViewModel {
     @ObservationIgnored private var generation: Task<Void, Never>?
     @ObservationIgnored private var stopRequested = false
     @ObservationIgnored private var didAutoload = false
+    @ObservationIgnored private var backgroundTask = UIBackgroundTaskIdentifier.invalid
 
     init() {
         engine = LlamaEngine()
@@ -60,7 +61,17 @@ final class ChatViewModel {
     func autoload(from store: ModelStore) async {
         guard !didAutoload else { return }
         didAutoload = true
-        let last = UserDefaults.standard.string(forKey: SettingKey.lastModel)
+        let defaults = UserDefaults.standard
+        // A load that never finished most likely got the app killed for memory.
+        // Loading the same model again on every launch would make it unusable.
+        if let unfinished = defaults.string(forKey: SettingKey.loadingModel) {
+            defaults.removeObject(forKey: SettingKey.loadingModel)
+            let name = store.model(named: unfinished)?.displayName ?? unfinished
+            status = .failed("\(name) didn't finish loading last time, so it wasn't loaded again. "
+                + "Pick it to retry, or choose a smaller context length in Settings first.")
+            return
+        }
+        let last = defaults.string(forKey: SettingKey.lastModel)
         if let model = last.flatMap(store.model(named:)) ?? (store.models.count == 1 ? store.models.first : nil) {
             await load(model)
         }
@@ -73,6 +84,9 @@ final class ChatViewModel {
         status = .loading(model.displayName)
         let contextLength = AppSettings.current.contextLength
         let projector = ModelStore.shared.projector(for: model)
+        // Cleared when the load returns, either way. Still set at the next launch: see autoload.
+        UserDefaults.standard.set(model.fileName, forKey: SettingKey.loadingModel)
+        defer { UserDefaults.standard.removeObject(forKey: SettingKey.loadingModel) }
         do {
             let info = try await engine.load(path: model.url.path, projector: projector?.url.path,
                                              contextLength: contextLength)
@@ -110,6 +124,7 @@ final class ChatViewModel {
         messages.append(Message(role: .user, raw: text, images: images))
 
         generation = Task {
+            defer { generation = nil }
             let settings = AppSettings.current
             // Context length is fixed when the context is created: reload if it changed.
             if settings.contextLength != loadedContextSetting, let file = loadedFile, let model = store.model(named: file) {
@@ -140,7 +155,6 @@ final class ChatViewModel {
             defer {
                 UIApplication.shared.isIdleTimerDisabled = false
                 if status == .generating { status = .ready }
-                generation = nil
             }
 
             // Redrawing a long reply on every token costs more than generating it,
@@ -175,7 +189,12 @@ final class ChatViewModel {
             } catch {
                 append(pending, to: id)
                 if let i = messages.firstIndex(where: { $0.id == id }) {
-                    messages[i].error = error.localizedDescription
+                    // A decode cut off by a stop (the app went to the background) is a stop, not an error.
+                    if stopRequested {
+                        messages[i].stopped = true
+                    } else {
+                        messages[i].error = error.localizedDescription
+                    }
                 }
             }
         }
@@ -192,6 +211,29 @@ final class ChatViewModel {
         guard generation != nil else { return }
         stopRequested = true
         engine.cancel()
+    }
+
+    /// The app left the screen. iOS forbids GPU work in the background, so the
+    /// reply stops here; a background task keeps the app alive until the token
+    /// being decoded is done.
+    func enterBackground() {
+        speech.stop()
+        voice.close()
+        guard let generation, backgroundTask == .invalid else { return }
+        stop()
+        backgroundTask = UIApplication.shared.beginBackgroundTask { [weak self] in
+            Task { @MainActor in self?.endBackgroundTask() }
+        }
+        Task {
+            await generation.value
+            endBackgroundTask()
+        }
+    }
+
+    private func endBackgroundTask() {
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
     }
 
     func newChat() {

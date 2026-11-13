@@ -38,6 +38,8 @@ enum SettingKey {
     static let maxTokens = "maxTokens"
     static let systemPrompt = "systemPrompt"
     static let lastModel = "lastModel"
+    /// The model being loaded right now. Left behind if the app dies mid-load.
+    static let loadingModel = "loadingModel"
     static let speechVoice = "speechVoice"
     static let speechLanguage = "speechLanguage"
     static let speechText = "speechText"
