@@ -40,6 +40,8 @@ enum SettingKey {
     static let lastModel = "lastModel"
     /// The model being loaded right now. Left behind if the app dies mid-load.
     static let loadingModel = "loadingModel"
+    /// The chat on screen, opened again at the next launch.
+    static let currentChat = "currentChat"
     static let speechVoice = "speechVoice"
     static let speechLanguage = "speechLanguage"
     static let speechText = "speechText"

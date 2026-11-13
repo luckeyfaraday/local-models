@@ -13,7 +13,7 @@ final class ChatViewModel {
     }
 
     struct Message: Identifiable, Equatable {
-        let id = UUID()
+        var id = UUID()
         let role: Role
         var raw: String
         var images: [ChatImage] = []
@@ -29,6 +29,9 @@ final class ChatViewModel {
     private(set) var status: Status = .noModel
     private(set) var info: ModelInfo?
     private(set) var loadedFile: String?
+    /// Saved chats, newest first.
+    private(set) var history: [ChatSummary] = []
+    private(set) var chatID = UUID()
 
     @ObservationIgnored private let engine: LlamaEngine
     /// Text to speech, for models that can talk. Shares the loaded model.
@@ -40,6 +43,12 @@ final class ChatViewModel {
     @ObservationIgnored private var generation: Task<Void, Never>?
     @ObservationIgnored private var stopRequested = false
     @ObservationIgnored private var didAutoload = false
+    @ObservationIgnored private let chats = ChatStore.standard
+    /// Chats are written in order, off the main thread.
+    @ObservationIgnored private let disk = DispatchQueue(label: "chats", qos: .utility)
+    /// Images of this chat already on disk.
+    @ObservationIgnored private var savedImages: Set<UUID> = []
+    @ObservationIgnored private var didRestore = false
     @ObservationIgnored private var backgroundTask = UIBackgroundTaskIdentifier.invalid
 
     init() {
@@ -122,9 +131,15 @@ final class ChatViewModel {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !images.isEmpty, !isBusy, loadedFile != nil else { return }
         messages.append(Message(role: .user, raw: text, images: images))
+        // Saved before the reply: the app may be killed for memory while it's made.
+        persist()
+        let chat = chatID
 
         generation = Task {
-            defer { generation = nil }
+            defer {
+                generation = nil
+                if chat == chatID { persist() }
+            }
             let settings = AppSettings.current
             // Context length is fixed when the context is created: reload if it changed.
             if settings.contextLength != loadedContextSetting, let file = loadedFile, let model = store.model(named: file) {
@@ -237,7 +252,83 @@ final class ChatViewModel {
     }
 
     func newChat() {
+        if generation != nil { persist() }
+        clear()
+    }
+
+    /// An empty chat on screen. What was there stays on disk as it was last saved.
+    private func clear() {
         stop()
         messages.removeAll()
+        chatID = UUID()
+        savedImages.removeAll()
+        UserDefaults.standard.removeObject(forKey: SettingKey.currentChat)
+    }
+
+    // MARK: - Saved chats
+
+    /// At launch: the list of chats, and the one that was on screen.
+    func restore() async {
+        guard !didRestore else { return }
+        didRestore = true
+        let chats = chats
+        history = await Task.detached { chats.summaries() }.value
+        if messages.isEmpty, let raw = UserDefaults.standard.string(forKey: SettingKey.currentChat),
+           let id = UUID(uuidString: raw) {
+            await open(id)
+        }
+    }
+
+    func open(_ id: UUID) async {
+        guard id != chatID else { return }
+        if generation != nil { persist() }
+        stop()
+        let chats = chats
+        let loaded = await Task.detached { () -> [Message]? in
+            guard let chat = try? chats.load(id) else { return nil }
+            return chat.messages.map { m in
+                let images = m.images.compactMap { name -> ChatImage? in
+                    guard let imageID = UUID(uuidString: (name as NSString).deletingPathExtension),
+                          let jpeg = chats.image(name, in: id) else { return nil }
+                    return ChatImage(id: imageID, jpeg: jpeg)
+                }
+                return Message(id: m.id, role: m.role, raw: m.raw, images: images, startsInThink: m.startsInThink,
+                               stats: m.stats, error: m.error, stopped: m.stopped)
+            }
+        }.value
+        guard let loaded else {
+            history.removeAll { $0.id == id }
+            return
+        }
+        messages = loaded
+        chatID = id
+        savedImages = Set(loaded.flatMap { $0.images.map(\.id) })
+        UserDefaults.standard.set(id.uuidString, forKey: SettingKey.currentChat)
+    }
+
+    func delete(_ id: UUID) {
+        history.removeAll { $0.id == id }
+        if id == chatID { clear() }
+        let chats = chats
+        disk.async { chats.delete(id) }
+    }
+
+    /// Writes the chat on screen. Images go to disk once.
+    private func persist() {
+        guard !messages.isEmpty else { return }
+        var newImages: [String: Data] = [:]
+        let stored = messages.map { m -> StoredMessage in
+            for image in m.images where savedImages.insert(image.id).inserted {
+                newImages[image.fileName] = image.jpeg
+            }
+            return StoredMessage(id: m.id, role: m.role, raw: m.raw, images: m.images.map(\.fileName),
+                                 startsInThink: m.startsInThink, stats: m.stats, error: m.error, stopped: m.stopped)
+        }
+        let chat = StoredChat(id: chatID, updated: Date(), model: info?.name, messages: stored)
+        history.removeAll { $0.id == chat.id }
+        history.insert(chat.summary, at: 0)
+        UserDefaults.standard.set(chatID.uuidString, forKey: SettingKey.currentChat)
+        let chats = chats
+        disk.async { try? chats.save(chat, images: newImages) }
     }
 }

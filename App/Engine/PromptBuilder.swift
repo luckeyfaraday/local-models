@@ -1,10 +1,6 @@
 import Foundation
 import llama
 
-enum Role: String {
-    case system, user, assistant
-}
-
 struct Turn {
     let role: Role
     let content: String
@@ -129,37 +125,5 @@ struct PromptBuilder {
             if n < 0 { return nil }
         }
         return String(decoding: buffer.prefix(Int(n)).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-    }
-}
-
-/// Splits raw model output into reasoning and answer.
-struct ParsedReply: Equatable {
-    var thinking: String?
-    var answer: String
-    var thinkingDone: Bool
-
-    init(raw: String, startsInThink: Bool) {
-        var rest = Substring(raw)
-        var inThink = startsInThink
-        if !inThink, let open = rest.range(of: "<think>"),
-           rest[..<open.lowerBound].allSatisfy(\.isWhitespace) {
-            inThink = true
-            rest = rest[open.upperBound...]
-        }
-        guard inThink else {
-            thinking = nil
-            answer = String(raw)
-            thinkingDone = true
-            return
-        }
-        if let close = rest.range(of: "</think>") {
-            thinking = rest[..<close.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-            answer = String(rest[close.upperBound...].drop { $0.isWhitespace })
-            thinkingDone = true
-        } else {
-            thinking = rest.trimmingCharacters(in: .whitespacesAndNewlines)
-            answer = ""
-            thinkingDone = false
-        }
     }
 }

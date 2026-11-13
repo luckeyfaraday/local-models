@@ -36,19 +36,6 @@ struct Sampling: Equatable {
     var repeatPenalty: Float
 }
 
-struct GenerationStats: Equatable {
-    var promptTokens = 0
-    var promptSeconds = 0.0
-    var generatedTokens = 0
-    var generationSeconds = 0.0
-    var hitContextLimit = false
-    /// Images read with the prompt. Their encoding counts in `promptSeconds`.
-    var images = 0
-
-    var tokensPerSecond: Double { generationSeconds > 0 ? Double(generatedTokens) / generationSeconds : 0 }
-    var promptTokensPerSecond: Double { promptSeconds > 0 ? Double(promptTokens) / promptSeconds : 0 }
-}
-
 enum EngineError: LocalizedError {
     case loadFailed(String)
     case contextFailed

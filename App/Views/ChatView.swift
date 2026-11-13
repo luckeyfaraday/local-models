@@ -10,6 +10,7 @@ struct ChatView: View {
     @State private var showSettings = false
     @State private var showSpeak = false
     @State private var showVoice = false
+    @State private var showHistory = false
     @State private var attachment: ChatImage?
     @State private var preparingImage = false
     @State private var showPhotos = false
@@ -32,9 +33,12 @@ struct ChatView: View {
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
                     Button { showSettings = true } label: { Image(systemName: "slider.horizontal.3") }
                         .accessibilityLabel("Settings")
+                    Button { showHistory = true } label: { Image(systemName: "clock.arrow.circlepath") }
+                        .disabled(chat.history.isEmpty)
+                        .accessibilityLabel("Chats")
                 }
                 ToolbarItem(placement: .principal) {
                     Button { showModels = true } label: { modelTitle }
@@ -60,6 +64,7 @@ struct ChatView: View {
             .sheet(isPresented: $showSettings) { SettingsView() }
             .sheet(isPresented: $showSpeak) { SpeakView() }
             .sheet(isPresented: $showVoice) { VoiceView() }
+            .sheet(isPresented: $showHistory) { HistoryView() }
             .photosPicker(isPresented: $showPhotos, selection: $photoItem, matching: .images)
             .onChange(of: photoItem) { _, item in
                 guard let item else { return }
@@ -73,7 +78,10 @@ struct ChatView: View {
                 if !sees { attachment = nil }
             }
         }
-        .task { await chat.autoload(from: store) }
+        .task {
+            await chat.restore()
+            await chat.autoload(from: store)
+        }
         .onChange(of: scenePhase) { _, phase in
             // Inactive (Control Center, an alert, the app switcher) leaves a reply
             // running. The background doesn't allow GPU work or an open mic.

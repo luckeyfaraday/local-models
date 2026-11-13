@@ -3,7 +3,7 @@ import UIKit
 /// An image attached to a chat message: an upright JPEG for the model and a
 /// small copy to show in the chat.
 struct ChatImage: Identifiable, Equatable, @unchecked Sendable {
-    let id = UUID()
+    let id: UUID
     let jpeg: Data
     let thumbnail: UIImage
 
@@ -31,9 +31,23 @@ struct ChatImage: Identifiable, Equatable, @unchecked Sendable {
         guard pixels.width >= 1, pixels.height >= 1 else { return nil }
         let upright = Self.render(image, fitting: Self.maxSide, pixels: pixels)
         guard let jpeg = upright.jpegData(compressionQuality: 0.9) else { return nil }
+        id = UUID()
         self.jpeg = jpeg
         thumbnail = Self.render(upright, fitting: Self.thumbnailSide, pixels: upright.size)
     }
+
+    /// An image of a saved chat, from the JPEG that was kept. Decodes it for
+    /// the thumbnail, so call it off the main thread.
+    init?(id: UUID, jpeg: Data) {
+        guard let image = UIImage(data: jpeg) else { return nil }
+        let pixels = CGSize(width: image.size.width * image.scale, height: image.size.height * image.scale)
+        guard pixels.width >= 1, pixels.height >= 1 else { return nil }
+        self.id = id
+        self.jpeg = jpeg
+        thumbnail = Self.render(image, fitting: Self.thumbnailSide, pixels: pixels)
+    }
+
+    var fileName: String { id.uuidString + ".jpg" }
 
     private static func render(_ image: UIImage, fitting side: CGFloat, pixels: CGSize) -> UIImage {
         let scale = min(1, side / max(pixels.width, pixels.height))
