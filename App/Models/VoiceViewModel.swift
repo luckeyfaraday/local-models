@@ -225,6 +225,7 @@ final class VoiceViewModel {
 
     private func audioChanged(_ change: VoiceAudio.Change) {
         guard audioRunning, !preparing else { return }
+        AppLog.note("talk: audio \(change), engine \(audio.isRunning ? "running" : "stopped")")
         switch change {
         case .interrupted:
             // The system has stopped the engine: nothing is heard or played until it's back.
@@ -260,7 +261,9 @@ final class VoiceViewModel {
                 if recoveries.count > 4 { throw VoiceAudioError.unstable }
                 try audio.restart()
                 interrupted = false
+                AppLog.note("talk: audio restarted")
             } catch {
+                AppLog.note("talk: audio not restarted: \(error.localizedDescription)")
                 hangUp(error.localizedDescription)
             }
         }
@@ -438,7 +441,7 @@ final class VoiceViewModel {
             let echo = await playing.value
             update(id) {
                 if $0.interrupted, let played = $0.playedSeconds {
-                    $0.reply = Self.heardPart(of: pieces, seconds: played)
+                    $0.reply = VoicePrompt.heardPart(of: pieces, seconds: played, secondsPerToken: Self.secondsPerToken)
                 }
             }
             save(id, question: samples, inputRate: info.audioInputRate, source: source, thermal: thermal,
@@ -449,17 +452,6 @@ final class VoiceViewModel {
     private func update(_ id: UUID, _ change: (inout Exchange) -> Void) {
         guard let i = exchanges.firstIndex(where: { $0.id == id }) else { return }
         change(&exchanges[i])
-    }
-
-    /// The text of the first `seconds` of a reply, to the last whole word.
-    private static func heardPart(of pieces: [String], seconds: Double) -> String {
-        let n = Int((seconds / secondsPerToken).rounded())
-        guard n > 0 else { return "" }
-        var text = pieces.prefix(n).joined()
-        if n < pieces.count, let space = text.lastIndex(where: \.isWhitespace) {
-            text = String(text[..<space])
-        }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Playback

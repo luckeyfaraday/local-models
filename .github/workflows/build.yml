@@ -20,6 +20,11 @@ jobs:
         run: |
           scripts/fetch-llama.sh
           echo "LLAMA_TAG=$(cut -d' ' -f1 LLAMA_VERSION)" >> "$GITHUB_ENV"
+          echo "GIT_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      # The parts of the app that need no iPhone (Package.swift, App/Logic).
+      - name: Logic tests
+        run: swift test
 
       - name: Generate Xcode project
         run: |

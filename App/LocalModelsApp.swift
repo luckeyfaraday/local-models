@@ -9,6 +9,8 @@ struct LocalModelsApp: App {
 
     init() {
         AppSettings.register()
+        AppLog.start()
+        Diagnostics.shared.start()
     }
 
     var body: some Scene {

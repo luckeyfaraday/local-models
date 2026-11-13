@@ -62,7 +62,18 @@ struct SettingsView: View {
                         }
                     }
                     LabeledContent("llama.cpp", value: Bundle.main.object(forInfoDictionaryKey: "LlamaBuild") as? String ?? "?")
-                    LabeledContent("App", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")
+                    LabeledContent("App", value: "\(AppLog.version) (\(AppLog.commit))")
+                }
+
+                Section {
+                    ShareLink("Share this run's log", item: AppLog.current)
+                    if FileManager.default.fileExists(atPath: AppLog.previous.path) {
+                        ShareLink("Share the previous run's log", item: AppLog.previous)
+                    }
+                } header: {
+                    Text("Logs")
+                } footer: {
+                    Text("What llama.cpp printed, and crash reports from iOS, are kept in Files › On My iPhone › Galerna Local Models › Logs. They stay on this iPhone unless you share them.")
                 }
             }
             .navigationTitle("Settings")

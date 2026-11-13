@@ -10,6 +10,7 @@ settings:
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     LLAMA_TAG: ${LLAMA_TAG}
+    GIT_COMMIT: ${GIT_COMMIT}
 targets:
   LocalModels:
     type: application
@@ -26,6 +27,7 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LlamaBuild: $(LLAMA_TAG)
+        GitCommit: $(GIT_COMMIT)
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false

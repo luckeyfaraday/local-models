@@ -5,3 +5,5 @@ dist/
 App/Info.plist
 DerivedData/
 .DS_Store
+.build/
+Package.resolved

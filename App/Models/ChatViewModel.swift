@@ -76,6 +76,7 @@ final class ChatViewModel {
         if let unfinished = defaults.string(forKey: SettingKey.loadingModel) {
             defaults.removeObject(forKey: SettingKey.loadingModel)
             let name = store.model(named: unfinished)?.displayName ?? unfinished
+            AppLog.note("not loading \(unfinished) again: its last load never finished")
             status = .failed("\(name) didn't finish loading last time, so it wasn't loaded again. "
                 + "Pick it to retry, or choose a smaller context length in Settings first.")
             return
@@ -96,6 +97,9 @@ final class ChatViewModel {
         // Cleared when the load returns, either way. Still set at the next launch: see autoload.
         UserDefaults.standard.set(model.fileName, forKey: SettingKey.loadingModel)
         defer { UserDefaults.standard.removeObject(forKey: SettingKey.loadingModel) }
+        AppLog.note("loading \(model.fileName), projector \(projector?.fileName ?? "none"), context \(contextLength), "
+            + "\(ModelStore.shared.availableMemory / 1_048_576) MB free")
+        let started = Date()
         do {
             let info = try await engine.load(path: model.url.path, projector: projector?.url.path,
                                              contextLength: contextLength)
@@ -105,7 +109,10 @@ final class ChatViewModel {
             loadedContextSetting = contextLength
             UserDefaults.standard.set(model.fileName, forKey: SettingKey.lastModel)
             status = .ready
+            AppLog.note(String(format: "loaded in %.1f s, %d MB free", Date().timeIntervalSince(started),
+                               ModelStore.shared.availableMemory / 1_048_576))
         } catch {
+            AppLog.note("load failed: \(error.localizedDescription)")
             info = nil
             builder = nil
             loadedFile = nil
@@ -209,6 +216,7 @@ final class ChatViewModel {
                         messages[i].stopped = true
                     } else {
                         messages[i].error = error.localizedDescription
+                        AppLog.note("reply failed: \(error.localizedDescription)")
                     }
                 }
             }

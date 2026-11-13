@@ -31,6 +31,18 @@ enum VoicePrompt {
         return s + "<|im_start|>user\n"
     }
 
+    /// The text of the first `seconds` of a reply (one piece per text token),
+    /// to the last whole word.
+    static func heardPart(of pieces: [String], seconds: Double, secondsPerToken: Double) -> String {
+        let n = Int((seconds / secondsPerToken).rounded())
+        guard n > 0 else { return "" }
+        var text = pieces.prefix(n).joined()
+        if n < pieces.count, let space = text.lastIndex(where: \.isWhitespace) {
+            text = String(text[..<space])
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Transcription of one clip, llama.cpp's ASR preset for LFM3 (`Perform ASR in English.`).
     static func asr(language: String, bos: String) -> String {
         let name = language.lowercased().hasPrefix("en") ? "English" : SpeechLanguage.name(for: language)
