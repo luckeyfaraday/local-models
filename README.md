@@ -16,6 +16,8 @@ pinned llama.cpp build supports, including models released yesterday.
   voice-chat mode (one generation interleaving text and speech, as llama-server's `/v1/realtime`
   does), and the text shows alongside. English only.
 - **Speak**: text to speech with the same model.
+- Chats are saved on the phone: the one you were in comes back at launch, earlier ones are in the
+  list behind the clock button.
 - Nothing leaves the phone except the model download.
 
 The default suggestion is Liquid AI's [LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF)
@@ -62,9 +64,20 @@ git commit -am "Bump llama.cpp" && git push   # CI builds a new IPA
 ## Building
 
 CI (`.github/workflows/build.yml`) runs on a GitHub macOS runner:
-`scripts/fetch-llama.sh` → `xcodegen generate` → `xcodebuild` without signing → `dist/LocalModels-unsigned.ipa`.
+`scripts/fetch-llama.sh` → `swift test` → `xcodegen generate` → `xcodebuild` without signing → `dist/LocalModels-unsigned.ipa`.
 Tagging `v*` attaches the IPA to a release. On a Mac you can run the same steps and open
 `LocalModels.xcodeproj`.
+
+`swift test` covers the code that needs no iPhone (`App/Logic`: reply parsing, speech chunking,
+the voice detector, saved chats). `Package.swift` exists only for that.
+
+## When something goes wrong
+
+The app keeps a log in Files › On My iPhone › Galerna Local Models › Logs: `log.txt` for this run
+and `log-previous.txt` for the one before, with what llama.cpp printed and the app's own notes
+(model loads, free memory, audio route changes). Crash and hang reports from iOS land there too as
+`diagnostics-*.json` at the next launch. Settings › About shows the commit and shares the logs.
+Nothing is sent anywhere.
 
 Models known to work, with the files the app picks:
 
@@ -78,11 +91,12 @@ Models known to work, with the files the app picks:
 
 - iOS stops GPU work in the background, so a reply stops when you leave the app. Downloads keep
   going.
-- Every turn re-reads the whole chat, since hybrid models such as LFM can't trim part of their
-  state. Prefill is fast on the GPU, but very long chats get slower to start.
+- Hybrid models such as LFM can't trim part of their state, so the model's memory is only reused
+  when a turn adds to the one before: then just the new message is read (the reply's footer says
+  how many tokens were kept). With reasoning on, after Talk or Speak, or after reopening a chat,
+  the whole chat is read again; images then skip the vision encoder if they were read lately.
 - Images need a vision model with its projector (LFM3-VL-2B). Each image is read at up to 1024
-  tokens (about 1 megapixel), and since every turn re-reads the chat, earlier images are encoded
-  again on each follow-up. No tool calling. Voice needs LFM3-Audio; each voice turn re-reads the conversation as
+  tokens (about 1 megapixel). No tool calling. Voice needs LFM3-Audio; each voice turn re-reads the conversation as
   text (the user's earlier turns as the model's own transcripts).
 
 ## License

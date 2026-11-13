@@ -187,6 +187,33 @@ final class VoicePromptTests: XCTestCase {
     }
 }
 
+final class PromptCacheTests: XCTestCase {
+    private func start(_ prompt: String, after cached: String) -> Int? {
+        PromptCache.newPartStart(of: Array(prompt.utf8), after: Array(cached.utf8))
+    }
+
+    func testANextTurnOnlyAdds() {
+        let first = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        let second = first + "Hello!<|im_end|>\n<|im_start|>user\nMore<|im_end|>\n<|im_start|>assistant\n"
+        XCTAssertEqual(start(second, after: first + "Hello!"), (first + "Hello!").utf8.count)
+    }
+
+    func testAChangedChatIsReadAgain() {
+        XCTAssertNil(start("system B\nuser", after: "system A\nuser"))
+        XCTAssertNil(start("abc", after: "abc"))
+        XCTAssertNil(start("ab", after: "abc"))
+        XCTAssertNil(start("abc", after: ""))
+    }
+
+    func testTheNewPartStartsOnAWholeCharacter() {
+        let cached = "caf\u{E9}"
+        let prompt = cached + "\u{301} ok"
+        let at = start(prompt, after: cached)
+        XCTAssertEqual(at, cached.utf8.count)
+        XCTAssertEqual(String(decoding: Array(prompt.utf8)[at!...], as: UTF8.self), "\u{301} ok")
+    }
+}
+
 final class ChatStoreTests: XCTestCase {
     private var store: ChatStore!
 

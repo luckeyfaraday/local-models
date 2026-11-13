@@ -55,6 +55,8 @@ final class ChatViewModel {
         engine = LlamaEngine()
         speech = SpeechViewModel(engine: engine)
         voice = VoiceViewModel(engine: engine)
+        NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil,
+                                               queue: .main) { [engine] _ in engine.dropImageCache() }
     }
 
     var isGenerating: Bool { status == .generating }
@@ -110,7 +112,7 @@ final class ChatViewModel {
             UserDefaults.standard.set(model.fileName, forKey: SettingKey.lastModel)
             status = .ready
             AppLog.note(String(format: "loaded in %.1f s, %d MB free", Date().timeIntervalSince(started),
-                               ModelStore.shared.availableMemory / 1_048_576))
+                               Int(ModelStore.shared.availableMemory / 1_048_576)))
         } catch {
             AppLog.note("load failed: \(error.localizedDescription)")
             info = nil
@@ -154,8 +156,9 @@ final class ChatViewModel {
             }
             guard let builder else { return }
 
-            // Every turn re-reads the whole chat, earlier images included. A model
-            // without vision gets the text alone.
+            // The whole chat goes to the engine every turn, earlier images
+            // included; it reads only what its memory doesn't hold already.
+            // A model without vision gets the text alone.
             let sees = seesImages
             var images: [Data] = []
             let turns = messages.compactMap { m -> Turn? in

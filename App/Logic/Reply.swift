@@ -12,6 +12,8 @@ struct GenerationStats: Equatable, Codable {
     var hitContextLimit = false
     /// Images read with the prompt. Their encoding counts in `promptSeconds`.
     var images = 0
+    /// Prompt tokens that were still in the model's memory from the turn before.
+    var reusedTokens: Int?
 
     var tokensPerSecond: Double { generationSeconds > 0 ? Double(generatedTokens) / generationSeconds : 0 }
     var promptTokensPerSecond: Double { promptSeconds > 0 ? Double(promptTokens) / promptSeconds : 0 }

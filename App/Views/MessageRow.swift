@@ -81,7 +81,8 @@ struct MessageRow: View {
         guard let stats = message.stats else { return message.stopped ? "Stopped" : nil }
         var parts = [String(format: "%d tok · %.1f tok/s", stats.generatedTokens, stats.tokensPerSecond)]
         let images = stats.images == 0 ? "" : stats.images == 1 ? " with image" : " with \(stats.images) images"
-        parts.append(String(format: "prompt %d tok%@ in %.1fs", stats.promptTokens, images, stats.promptSeconds))
+        let kept = (stats.reusedTokens ?? 0) > 0 ? " (\(stats.reusedTokens ?? 0) kept)" : ""
+        parts.append(String(format: "prompt %d tok%@%@ in %.1fs", stats.promptTokens, kept, images, stats.promptSeconds))
         if message.stopped { parts.append("stopped") }
         if stats.hitContextLimit { parts.append("context full") }
         return parts.joined(separator: " · ")
