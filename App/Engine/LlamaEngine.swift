@@ -499,7 +499,8 @@ final class LlamaEngine: @unchecked Sendable {
         var nPast: llama_pos = 0
         for i in 0..<count {
             if isCancelled { return nil }
-            var next: llama_pos = 0
+            // Text chunks add their token count to `next`, image chunks set it.
+            var next = nPast
             let rc = mtmd_helper_eval_chunk_single(mtmd, ctx, mtmd_input_chunks_get(chunks, i), nPast, 0,
                                                    batchSize, i == count - 1, &next)
             if rc != 0 {
