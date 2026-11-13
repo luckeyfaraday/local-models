@@ -111,6 +111,7 @@ struct ModelsView: View {
                     Button("Search") { Task { await fetch() } }.buttonStyle(.borderless)
                 }
             }
+            suggestions
             if let error = fetchError ?? store.lastError {
                 Text(error).font(.footnote).foregroundStyle(.orange)
             }
@@ -155,7 +156,31 @@ struct ModelsView: View {
         } header: {
             Text("Get from Hugging Face")
         } footer: {
-            Text("Any public repo with .gguf files. Vision and audio models also get their projector (mmproj). You can copy GGUF files into Files › On My iPhone › Local Models too.")
+            Text("Any public repo with .gguf files. Vision and audio models also get their projector (mmproj). You can copy GGUF files into Files › On My iPhone › Galerna Local Models too.")
+        }
+    }
+
+    private var suggestions: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(ModelStore.suggestions) { suggestion in
+                    let selected = ModelStore.normalizeRepo(repo) == suggestion.repo
+                    Button {
+                        repo = suggestion.repo
+                        Task { await fetch() }
+                    } label: {
+                        VStack(spacing: 1) {
+                            Text(suggestion.name).font(.caption.weight(.semibold))
+                            Text(suggestion.detail).font(.caption2).foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 5)
+                        .background(selected ? Color.accentColor.opacity(0.18) : Color(.tertiarySystemFill), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(fetching)
+                }
+            }
         }
     }
 

@@ -8,6 +8,16 @@ enum Role: String {
 struct Turn {
     let role: Role
     let content: String
+    /// Images attached to this turn. They go before the text, one media marker
+    /// each, as the LFM3-VL template puts image parts ahead of the question.
+    var images = 0
+
+    /// What mtmd replaces with an image (`<__media__>`).
+    static let mediaMarker = String(cString: mtmd_default_marker())
+
+    var text: String {
+        images > 0 ? String(repeating: Turn.mediaMarker, count: images) + content : content
+    }
 }
 
 struct RenderedPrompt {
@@ -78,7 +88,7 @@ struct PromptBuilder {
             case .system:
                 continue
             case .user:
-                s += "<|im_start|>user\n\(turn.content)<|im_end|>\n"
+                s += "<|im_start|>user\n\(turn.text)<|im_end|>\n"
             case .assistant:
                 // Earlier reasoning is dropped, as the model's own template does.
                 let prefix = style == .lfm3 ? "<think></think>" : ""
@@ -103,7 +113,7 @@ struct PromptBuilder {
         defer { owned.forEach { free($0) } }
         var messages: [llama_chat_message] = []
         for turn in turns {
-            guard let role = strdup(turn.role.rawValue), let content = strdup(turn.content) else { return nil }
+            guard let role = strdup(turn.role.rawValue), let content = strdup(turn.text) else { return nil }
             owned += [role, content]
             messages.append(llama_chat_message(role: UnsafePointer(role), content: UnsafePointer(content)))
         }

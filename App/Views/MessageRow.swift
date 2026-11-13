@@ -9,12 +9,24 @@ struct MessageRow: View {
         if message.role == .user {
             HStack {
                 Spacer(minLength: 48)
-                Text(message.raw)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .foregroundStyle(.white)
-                    .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                VStack(alignment: .trailing, spacing: 6) {
+                    ForEach(message.images) { image in
+                        Image(uiImage: image.thumbnail)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: 220, maxHeight: 280)
+                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .accessibilityLabel("Attached image")
+                    }
+                    if !message.raw.isEmpty {
+                        Text(message.raw)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .foregroundStyle(.white)
+                            .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    }
+                }
             }
         } else {
             assistant
@@ -68,7 +80,8 @@ struct MessageRow: View {
     private var footer: String? {
         guard let stats = message.stats else { return message.stopped ? "Stopped" : nil }
         var parts = [String(format: "%d tok · %.1f tok/s", stats.generatedTokens, stats.tokensPerSecond)]
-        parts.append(String(format: "prompt %d tok in %.1fs", stats.promptTokens, stats.promptSeconds))
+        let images = stats.images == 0 ? "" : stats.images == 1 ? " with image" : " with \(stats.images) images"
+        parts.append(String(format: "prompt %d tok%@ in %.1fs", stats.promptTokens, images, stats.promptSeconds))
         if message.stopped { parts.append("stopped") }
         if stats.hitContextLimit { parts.append("context full") }
         return parts.joined(separator: " · ")

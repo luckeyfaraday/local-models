@@ -22,7 +22,7 @@ targets:
     info:
       path: App/Info.plist
       properties:
-        CFBundleDisplayName: Local Models
+        CFBundleDisplayName: Galerna Local Models
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LlamaBuild: $(LLAMA_TAG)
@@ -37,7 +37,7 @@ targets:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         ITSAppUsesNonExemptEncryption: false
-        NSMicrophoneUsageDescription: Local Models listens while you talk to a model that understands speech. The audio stays on this iPhone.
+        NSMicrophoneUsageDescription: Galerna Local Models listens while you talk to a model that understands speech. The audio stays on this iPhone.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.luckeyfaraday.localmodels

@@ -42,6 +42,8 @@ struct GenerationStats: Equatable {
     var generatedTokens = 0
     var generationSeconds = 0.0
     var hitContextLimit = false
+    /// Images read with the prompt. Their encoding counts in `promptSeconds`.
+    var images = 0
 
     var tokensPerSecond: Double { generationSeconds > 0 ? Double(generatedTokens) / generationSeconds : 0 }
     var promptTokensPerSecond: Double { promptSeconds > 0 ? Double(promptTokens) / promptSeconds : 0 }
@@ -58,6 +60,8 @@ enum EngineError: LocalizedError {
     case speechFailed(String)
     case cannotTalk
     case voiceFailed(String)
+    case cannotSee
+    case imageFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -81,6 +85,10 @@ enum EngineError: LocalizedError {
             return "The loaded model can't hold a spoken conversation."
         case .voiceFailed(let step):
             return "The voice reply failed: \(step)."
+        case .cannotSee:
+            return "The loaded model can't see images. Load a vision model with its projector, like LFM3-VL-2B."
+        case .imageFailed(let step):
+            return "Reading the image failed: \(step)."
         }
     }
 }
@@ -94,6 +102,11 @@ final class LlamaEngine: @unchecked Sendable {
     }
 
     private static let backendReady: Void = llama_backend_init()
+
+    /// Most tokens one image may take. LFM3-VL picks its resolution per image
+    /// (32×32 pixels per token, up to 4096 tokens); 1024 keeps a photo or a
+    /// screenshot readable while the encoder and prefill stay quick on a phone.
+    static let imageMaxTokens: Int32 = 1024
 
     private let queue = DispatchQueue(label: "llama.engine", qos: .userInitiated)
     private var model: OpaquePointer?
@@ -132,7 +145,9 @@ final class LlamaEngine: @unchecked Sendable {
         cancelLock.unlock()
     }
 
-    func generate(prompt: String, addBOS: Bool, sampling: Sampling, maxTokens: Int,
+    /// Streams a reply. `prompt` holds one media marker (`mtmd_default_marker()`)
+    /// per entry of `images` (encoded image files), in the same order.
+    func generate(prompt: String, addBOS: Bool, images: [Data] = [], sampling: Sampling, maxTokens: Int,
                   banned: [String] = []) -> AsyncThrowingStream<Event, Error> {
         setCancelled(false)
         return AsyncThrowingStream { continuation in
@@ -141,7 +156,7 @@ final class LlamaEngine: @unchecked Sendable {
             }
             queue.async {
                 do {
-                    let stats = try self.generateNow(prompt: prompt, addBOS: addBOS, sampling: sampling,
+                    let stats = try self.generateNow(prompt: prompt, addBOS: addBOS, images: images, sampling: sampling,
                                                      maxTokens: maxTokens, banned: banned) {
                         continuation.yield(.text($0))
                     }
@@ -278,6 +293,7 @@ final class LlamaEngine: @unchecked Sendable {
             mediaParams.n_threads = threads
             mediaParams.print_timings = false
             mediaParams.warmup = false
+            mediaParams.image_max_tokens = LlamaEngine.imageMaxTokens
             media = mtmd_init_from_file(projector, loaded, mediaParams)
             if media == nil {
                 llama_free(ctx)
@@ -340,20 +356,9 @@ final class LlamaEngine: @unchecked Sendable {
         talks = false
     }
 
-    private func generateNow(prompt: String, addBOS: Bool, sampling: Sampling, maxTokens: Int, banned: [String],
-                             emit: (String) -> Void) throws -> GenerationStats {
+    private func generateNow(prompt: String, addBOS: Bool, images: [Data], sampling: Sampling, maxTokens: Int,
+                             banned: [String], emit: (String) -> Void) throws -> GenerationStats {
         guard let ctx = context, let vocab else { throw EngineError.notLoaded }
-
-        var tokens = tokenize(prompt, vocab: vocab)
-        if addBOS {
-            let bos = llama_vocab_bos(vocab)
-            if bos >= 0 && tokens.first != bos { tokens.insert(bos, at: 0) }
-        }
-        if tokens.count >= nCtx - 8 { throw EngineError.promptTooLong(tokens: tokens.count, context: nCtx) }
-
-        // Hybrid models (LFM's conv layers) can't drop part of their state, so
-        // every turn starts from a clean memory and re-reads the whole chat.
-        llama_memory_clear(llama_get_memory(ctx), true)
 
         // Only single-token strings (special tags like <think>) can be banned.
         // A speaking model stays in text here: it must not switch to audio output.
@@ -366,33 +371,33 @@ final class LlamaEngine: @unchecked Sendable {
         defer { llama_sampler_free(sampler) }
 
         var stats = GenerationStats()
-        stats.promptTokens = tokens.count
-
         let promptStart = DispatchTime.now().uptimeNanoseconds
-        let batchSize = Int(llama_n_batch(ctx))
-        var offset = 0
-        while offset < tokens.count {
-            if isCancelled { return stats }
-            let count = min(batchSize, tokens.count - offset)
-            let start = offset
-            let rc = tokens.withUnsafeMutableBufferPointer { buffer in
-                llama_decode(ctx, llama_batch_get_one(buffer.baseAddress! + start, Int32(count)))
-            }
-            if rc != 0 { throw EngineError.decodeFailed(rc) }
-            offset += count
+
+        // Hybrid models (LFM's conv layers) can't drop part of their state, so
+        // every turn starts from a clean memory and re-reads the whole chat.
+        let next: llama_pos?
+        if images.isEmpty {
+            next = try readText(prompt, addBOS: addBOS, ctx: ctx, vocab: vocab, stats: &stats)
+        } else {
+            next = try readWithImages(prompt, addBOS: addBOS, images: images, ctx: ctx, stats: &stats)
         }
+        guard var position = next else { return stats } // cancelled while reading
         let generationStart = DispatchTime.now().uptimeNanoseconds
         stats.promptSeconds = Double(generationStart - promptStart) / 1e9
 
+        // Generated tokens go in at explicit positions, which stay right after
+        // images that take fewer positions than tokens (M-RoPE models).
+        var batch = llama_batch_init(1, 0, 1)
+        defer { llama_batch_free(batch) }
+
         var pending: [UInt8] = []
-        var position = tokens.count
         while stats.generatedTokens < maxTokens {
             if isCancelled { break }
-            if position >= nCtx {
+            if stats.promptTokens + stats.generatedTokens >= nCtx {
                 stats.hitContextLimit = true
                 break
             }
-            var token = llama_sampler_sample(sampler, ctx, -1)
+            let token = llama_sampler_sample(sampler, ctx, -1)
             if llama_vocab_is_eog(vocab, token) { break }
 
             pending += piece(token, vocab: vocab)
@@ -404,9 +409,13 @@ final class LlamaEngine: @unchecked Sendable {
                 pending.removeAll()
             }
 
-            let rc = withUnsafeMutablePointer(to: &token) { pointer in
-                llama_decode(ctx, llama_batch_get_one(pointer, 1))
-            }
+            batch.token[0] = token
+            batch.pos[0] = position
+            batch.n_seq_id[0] = 1
+            batch.seq_id[0]![0] = 0
+            batch.logits[0] = 1
+            batch.n_tokens = 1
+            let rc = llama_decode(ctx, batch)
             if rc != 0 { throw EngineError.decodeFailed(rc) }
             position += 1
             stats.generatedTokens += 1
@@ -414,6 +423,92 @@ final class LlamaEngine: @unchecked Sendable {
         if !pending.isEmpty { emit(String(decoding: pending, as: UTF8.self)) }
         stats.generationSeconds = Double(DispatchTime.now().uptimeNanoseconds - generationStart) / 1e9
         return stats
+    }
+
+    /// Reads a text-only prompt. Returns the next position, or nil if cancelled.
+    private func readText(_ prompt: String, addBOS: Bool, ctx: OpaquePointer, vocab: OpaquePointer,
+                          stats: inout GenerationStats) throws -> llama_pos? {
+        var tokens = tokenize(prompt, vocab: vocab)
+        if addBOS {
+            let bos = llama_vocab_bos(vocab)
+            if bos >= 0 && tokens.first != bos { tokens.insert(bos, at: 0) }
+        }
+        if tokens.count >= nCtx - 8 { throw EngineError.promptTooLong(tokens: tokens.count, context: nCtx) }
+        stats.promptTokens = tokens.count
+
+        llama_memory_clear(llama_get_memory(ctx), true)
+        let batchSize = Int(llama_n_batch(ctx))
+        var offset = 0
+        while offset < tokens.count {
+            if isCancelled { return nil }
+            let count = min(batchSize, tokens.count - offset)
+            let start = offset
+            let rc = tokens.withUnsafeMutableBufferPointer { buffer in
+                llama_decode(ctx, llama_batch_get_one(buffer.baseAddress! + start, Int32(count)))
+            }
+            if rc != 0 { throw EngineError.decodeFailed(rc) }
+            offset += count
+        }
+        return llama_pos(tokens.count)
+    }
+
+    /// Reads a prompt with images in it, as llama-mtmd-cli does: mtmd splits it
+    /// into text and image chunks at the media markers, text is decoded as
+    /// tokens, each image goes through the vision encoder and its embeddings
+    /// are decoded in place. Returns the next position, or nil if cancelled.
+    private func readWithImages(_ prompt: String, addBOS: Bool, images: [Data], ctx: OpaquePointer,
+                                stats: inout GenerationStats) throws -> llama_pos? {
+        guard let mtmd, mtmd_support_vision(mtmd) else { throw EngineError.cannotSee }
+
+        var bitmaps: [OpaquePointer?] = []
+        defer { bitmaps.forEach { mtmd_bitmap_free($0) } }
+        for (i, data) in images.enumerated() {
+            guard let image = RGBImage(data: data) else {
+                throw EngineError.imageFailed("image \(i + 1) couldn't be decoded")
+            }
+            let bitmap = image.pixels.withUnsafeBufferPointer {
+                mtmd_bitmap_init(UInt32(image.width), UInt32(image.height), $0.baseAddress)
+            }
+            guard let bitmap else { throw EngineError.imageFailed("image \(i + 1) is too large") }
+            bitmaps.append(bitmap)
+        }
+
+        guard let chunks = mtmd_input_chunks_init() else { throw EngineError.imageFailed("out of memory") }
+        defer { mtmd_input_chunks_free(chunks) }
+        // The BOS goes in as text, as the text-only path inserts the token.
+        let bos = bosText()
+        let text = addBOS && !bos.isEmpty && !prompt.hasPrefix(bos) ? bos + prompt : prompt
+        let rc = text.withCString { cText -> Int32 in
+            var input = mtmd_input_text(text: cText, text_len: strlen(cText), add_special: false, parse_special: true)
+            return bitmaps.withUnsafeBufferPointer { mtmd_tokenize(mtmd, chunks, &input, $0.baseAddress, $0.count) }
+        }
+        switch rc {
+        case 0: break
+        case 1: throw EngineError.imageFailed("the prompt and the images don't match")
+        default: throw EngineError.imageFailed("the model couldn't prepare the image (\(rc))")
+        }
+
+        let tokens = mtmd_helper_get_n_tokens(chunks)
+        if tokens >= nCtx - 8 { throw EngineError.promptTooLong(tokens: tokens, context: nCtx) }
+        stats.promptTokens = tokens
+        stats.images = images.count
+
+        llama_memory_clear(llama_get_memory(ctx), true)
+        let batchSize = Int32(llama_n_batch(ctx))
+        let count = mtmd_input_chunks_size(chunks)
+        var nPast: llama_pos = 0
+        for i in 0..<count {
+            if isCancelled { return nil }
+            var next: llama_pos = 0
+            let rc = mtmd_helper_eval_chunk_single(mtmd, ctx, mtmd_input_chunks_get(chunks, i), nPast, 0,
+                                                   batchSize, i == count - 1, &next)
+            if rc != 0 {
+                let image = mtmd_input_chunk_get_type(mtmd_input_chunks_get(chunks, i)) == MTMD_INPUT_CHUNK_TYPE_IMAGE
+                throw image ? EngineError.imageFailed("the vision encoder failed (\(rc))") : EngineError.decodeFailed(rc)
+            }
+            nPast = next
+        }
+        return nPast
     }
 
     private func speakNow(_ request: SpeechRequest, emit: @escaping ([Float], Int) -> Void) throws -> SpeechStats {

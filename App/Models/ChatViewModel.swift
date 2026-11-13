@@ -16,6 +16,7 @@ final class ChatViewModel {
         let id = UUID()
         let role: Role
         var raw: String
+        var images: [ChatImage] = []
         var startsInThink = false
         var stats: GenerationStats?
         var error: String?
@@ -52,6 +53,7 @@ final class ChatViewModel {
         return status == .generating || speech.isSpeaking || voice.isBusy
     }
     var supportsThinking: Bool { builder?.supportsThinking ?? false }
+    var seesImages: Bool { info?.seesImages == true }
 
     // MARK: - Models
 
@@ -102,10 +104,10 @@ final class ChatViewModel {
 
     // MARK: - Chat
 
-    func send(_ text: String, store: ModelStore) {
+    func send(_ text: String, images: [ChatImage] = [], store: ModelStore) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isBusy, loadedFile != nil else { return }
-        messages.append(Message(role: .user, raw: text))
+        guard !text.isEmpty || !images.isEmpty, !isBusy, loadedFile != nil else { return }
+        messages.append(Message(role: .user, raw: text, images: images))
 
         generation = Task {
             let settings = AppSettings.current
@@ -115,12 +117,18 @@ final class ChatViewModel {
             }
             guard let builder else { return }
 
+            // Every turn re-reads the whole chat, earlier images included. A model
+            // without vision gets the text alone.
+            let sees = seesImages
+            var images: [Data] = []
             let turns = messages.compactMap { m -> Turn? in
                 if m.role == .assistant {
                     let answer = m.reply.answer
                     return answer.isEmpty ? nil : Turn(role: .assistant, content: answer)
                 }
-                return Turn(role: m.role, content: m.raw)
+                let attached = sees ? m.images : []
+                images += attached.map(\.jpeg)
+                return Turn(role: m.role, content: m.raw, images: attached.count)
             }
             let prompt = builder.render(turns, system: settings.systemPrompt, thinking: settings.thinking)
             let reply = Message(role: .assistant, raw: "", startsInThink: prompt.startsInThink)
@@ -141,7 +149,7 @@ final class ChatViewModel {
             var lastFlush = Date.distantPast
 
             do {
-                let stream = engine.generate(prompt: prompt.text, addBOS: builder.addBOS,
+                let stream = engine.generate(prompt: prompt.text, addBOS: builder.addBOS, images: images,
                                              sampling: settings.preset.sampling, maxTokens: settings.maxTokens,
                                              banned: prompt.banned)
                 for try await event in stream {

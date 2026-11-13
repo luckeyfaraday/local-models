@@ -223,7 +223,7 @@ final class VoiceViewModel {
         Task {
             guard await prepare(info) else { return }
             if AVAudioApplication.shared.recordPermission == .denied {
-                phase = .failed("Microphone access is off. Turn it on in Settings › Local Models.")
+                phase = .failed("Microphone access is off. Turn it on in Settings › Galerna Local Models.")
                 return
             }
             muted = true

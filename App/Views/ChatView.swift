@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 struct ChatView: View {
@@ -9,6 +10,11 @@ struct ChatView: View {
     @State private var showSettings = false
     @State private var showSpeak = false
     @State private var showVoice = false
+    @State private var attachment: ChatImage?
+    @State private var preparingImage = false
+    @State private var showPhotos = false
+    @State private var photoItem: PhotosPickerItem?
+    @State private var imageError: String?
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -51,6 +57,18 @@ struct ChatView: View {
             .sheet(isPresented: $showSettings) { SettingsView() }
             .sheet(isPresented: $showSpeak) { SpeakView() }
             .sheet(isPresented: $showVoice) { VoiceView() }
+            .photosPicker(isPresented: $showPhotos, selection: $photoItem, matching: .images)
+            .onChange(of: photoItem) { _, item in
+                guard let item else { return }
+                photoItem = nil
+                attach {
+                    guard let data = try await item.loadTransferable(type: Data.self) else { return nil }
+                    return await ChatImage.make(from: data)
+                }
+            }
+            .onChange(of: chat.seesImages) { _, sees in
+                if !sees { attachment = nil }
+            }
         }
         .task { await chat.autoload(from: store) }
         .onChange(of: scenePhase) { _, phase in
@@ -107,30 +125,19 @@ struct ChatView: View {
     }
 
     private var canSend: Bool {
-        chat.status == .ready && !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        chat.status == .ready && !preparingImage
+            && (attachment != nil || !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     private var inputBar: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            TextField(placeholder, text: $input, axis: .vertical)
-                .lineLimit(1...6)
-                .focused($inputFocused)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .disabled(chat.loadedFile == nil)
-
-            if chat.isGenerating {
-                Button { chat.stop() } label: {
-                    Image(systemName: "stop.circle.fill").font(.system(size: 34))
-                }
-                .accessibilityLabel("Stop")
-            } else {
-                Button(action: send) {
-                    Image(systemName: "arrow.up.circle.fill").font(.system(size: 34))
-                }
-                .disabled(!canSend)
-                .accessibilityLabel("Send")
+        VStack(alignment: .leading, spacing: 8) {
+            if attachment != nil || preparingImage || imageError != nil {
+                attachmentPreview
+            }
+            HStack(alignment: .bottom, spacing: 10) {
+                if chat.seesImages { attachMenu }
+                textField
+                sendButton
             }
         }
         .padding(.horizontal, 12)
@@ -139,14 +146,111 @@ struct ChatView: View {
         .background(.bar)
     }
 
+    private var attachMenu: some View {
+        Menu {
+            Button { showPhotos = true } label: { Label("Photo Library", systemImage: "photo.on.rectangle") }
+            Button {
+                attach {
+                    guard let image = UIPasteboard.general.image else { return nil }
+                    return await ChatImage.make(from: image)
+                }
+            } label: {
+                Label("Paste Image", systemImage: "doc.on.clipboard")
+            }
+        } label: {
+            Image(systemName: "photo.badge.plus")
+                .font(.system(size: 22))
+                .frame(width: 34, height: 40)
+        }
+        .disabled(chat.isBusy)
+        .accessibilityLabel("Attach image")
+    }
+
+    private var attachmentPreview: some View {
+        HStack(spacing: 8) {
+            if let attachment {
+                Image(uiImage: attachment.thumbnail)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 64, height: 64)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(alignment: .topTrailing) {
+                        Button { self.attachment = nil } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 20))
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .black.opacity(0.6))
+                        }
+                        .offset(x: 6, y: -6)
+                        .accessibilityLabel("Remove image")
+                    }
+                    .accessibilityLabel("Attached image")
+            } else if preparingImage {
+                ProgressView()
+                    .frame(width: 64, height: 64)
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            if let imageError {
+                Text(imageError).font(.footnote).foregroundStyle(.orange)
+            }
+        }
+        .padding(.top, 6)
+        .padding(.leading, chat.seesImages ? 44 : 0)
+    }
+
+    private func attach(_ load: @escaping () async throws -> ChatImage?) {
+        imageError = nil
+        preparingImage = true
+        Task {
+            defer { preparingImage = false }
+            do {
+                if let image = try await load() {
+                    attachment = image
+                } else {
+                    imageError = "No image to attach."
+                }
+            } catch {
+                imageError = "Couldn't read that image: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private var textField: some View {
+        TextField(placeholder, text: $input, axis: .vertical)
+            .lineLimit(1...6)
+            .focused($inputFocused)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .disabled(chat.loadedFile == nil)
+    }
+
+    @ViewBuilder private var sendButton: some View {
+        if chat.isGenerating {
+            Button { chat.stop() } label: {
+                Image(systemName: "stop.circle.fill").font(.system(size: 34))
+            }
+            .accessibilityLabel("Stop")
+        } else {
+            Button(action: send) {
+                Image(systemName: "arrow.up.circle.fill").font(.system(size: 34))
+            }
+            .disabled(!canSend)
+            .accessibilityLabel("Send")
+        }
+    }
+
     private var placeholder: String {
-        chat.loadedFile == nil ? "Load a model to start" : "Message"
+        if chat.loadedFile == nil { return "Load a model to start" }
+        return attachment != nil ? "Ask about the image" : "Message"
     }
 
     private func send() {
         guard canSend else { return }
-        chat.send(input, store: store)
+        chat.send(input, images: attachment.map { [$0] } ?? [], store: store)
         input = ""
+        attachment = nil
+        imageError = nil
     }
 }
 
@@ -188,6 +292,10 @@ private struct EmptyChatView: View {
                             .font(.footnote).foregroundStyle(.tint)
                     } else if info.speaks {
                         Label("Can speak: tap the waveform button", systemImage: "waveform")
+                            .font(.footnote).foregroundStyle(.tint)
+                    }
+                    if info.seesImages {
+                        Label("Can see images: attach a photo or screenshot", systemImage: "photo")
                             .font(.footnote).foregroundStyle(.tint)
                     }
                     Text("Runs on this iPhone. Nothing leaves the device.")

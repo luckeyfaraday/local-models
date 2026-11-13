@@ -4,7 +4,7 @@ import os
 
 /// GGUF files on the phone, plus downloads from Hugging Face.
 /// Models live in the app's Documents folder, which the Files app shows under
-/// On My iPhone › Local Models, so GGUFs can also be copied in by hand.
+/// On My iPhone › Galerna Local Models, so GGUFs can also be copied in by hand.
 @Observable @MainActor
 final class ModelStore {
     static let shared = ModelStore()
@@ -55,6 +55,20 @@ final class ModelStore {
     }
 
     nonisolated static let defaultRepo = "LiquidAI/LFM3-1.7B-GGUF"
+
+    /// Repos offered as one-tap picks in the model browser.
+    struct Suggestion: Identifiable {
+        let name: String
+        let detail: String
+        let repo: String
+        var id: String { repo }
+    }
+
+    nonisolated static let suggestions = [
+        Suggestion(name: "LFM3-1.7B", detail: "chat", repo: defaultRepo),
+        Suggestion(name: "LFM3-VL-2B", detail: "sees images", repo: "LiquidAI/LFM3-VL-2B-GGUF"),
+        Suggestion(name: "LFM3-Audio-2B", detail: "talks", repo: "LiquidAI/LFM3-Audio-2B-GGUF"),
+    ]
     private static let pairingsKey = "projectorPairings"
 
     /// Loadable models. Projectors are kept apart: they only work next to their model.

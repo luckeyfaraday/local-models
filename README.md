@@ -1,13 +1,16 @@
-# Local Models
+# Galerna Local Models
 
 An iPhone app that runs open-weight language models on the phone itself. It wraps
 [llama.cpp](https://github.com/ggml-org/llama.cpp) on the GPU (Metal), so it loads any GGUF the
 pinned llama.cpp build supports, including models released yesterday.
 
-- Download any `.gguf` from a public Hugging Face repo inside the app, or copy one in through
-  Files › On My iPhone › Local Models.
+- Download any `.gguf` from a public Hugging Face repo inside the app (one-tap picks for LFM3-1.7B,
+  LFM3-VL-2B and LFM3-Audio-2B), or copy one in through Files › On My iPhone › Galerna Local Models.
 - Streaming chat with tokens/sec, reasoning on/off for thinking models (LFM3, Qwen-style),
   sampling presets, context length and a system prompt.
+- **Images** with [LFM3-VL-2B](https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF) (model + its `mmproj`
+  projector): attach a photo or screenshot in chat (Photos, or paste) and ask about it. Text-only
+  chat keeps working with the same model.
 - **Talk** with [LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF) (model + its
   `mmproj` projector): tap the mic, speak, tap again. The model answers out loud with its own
   voice-chat mode (one generation interleaving text and speech, as llama-server's `/v1/realtime`
@@ -63,13 +66,23 @@ CI (`.github/workflows/build.yml`) runs on a GitHub macOS runner:
 Tagging `v*` attaches the IPA to a release. On a Mac you can run the same steps and open
 `LocalModels.xcodeproj`.
 
+Models known to work, with the files the app picks:
+
+| Model | Repo | Files | Needs llama.cpp |
+| --- | --- | --- | --- |
+| LFM3-1.7B (chat) | `LiquidAI/LFM3-1.7B-GGUF` | `LFM3-1.7B-QAD-Q4_0` | b11960 |
+| LFM3-VL-2B (images) | `LiquidAI/LFM3-VL-2B-GGUF` | `LFM3-VL-2B-QAD-Q4_0` + `mmproj-LFM3-VL-2B-Q8_0` (1.25 GB) | b11960 |
+| LFM3-Audio-2B (voice) | `LiquidAI/LFM3-Audio-2B-GGUF` | Q4_0 + `mmproj` Q8_0 | b11960 |
+
 ## Limits
 
 - iOS stops GPU work in the background, so a reply stops when you leave the app. Downloads keep
   going.
 - Every turn re-reads the whole chat, since hybrid models such as LFM can't trim part of their
   state. Prefill is fast on the GPU, but very long chats get slower to start.
-- No vision or tool calling. Voice needs LFM3-Audio; each voice turn re-reads the conversation as
+- Images need a vision model with its projector (LFM3-VL-2B). Each image is read at up to 1024
+  tokens (about 1 megapixel), and since every turn re-reads the chat, earlier images are encoded
+  again on each follow-up. No tool calling. Voice needs LFM3-Audio; each voice turn re-reads the conversation as
   text (the user's earlier turns as the model's own transcripts).
 
 ## License
