@@ -25,25 +25,83 @@ final class VoiceAudio: @unchecked Sendable {
     private let sink = Sink()
     private var outputRate = 0
     private var configured = false
+    private var attached = false
+    private var tapped = false
+    private var observers: [NSObjectProtocol] = []
+
+    /// What the system did to the audio while a conversation was open.
+    enum Change: Sendable {
+        /// A phone call, Siri or an alarm took the audio: the engine is stopped.
+        case interrupted
+        /// The interruption is over.
+        case interruptionEnded
+        /// The route or its format changed (headphones in or out, AirPods
+        /// connected). If the format changed, the engine has stopped itself.
+        case changed
+    }
+
+    /// Called on the main actor. Set once, before start().
+    var onChange: (@MainActor @Sendable (Change) -> Void)?
+
+    init() {
+        let center = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
+        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: session,
+                                            queue: nil) { [weak self] note in
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            self?.report(type == .began ? .interrupted : .interruptionEnded)
+        })
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: session,
+                                            queue: nil) { [weak self] _ in self?.report(.changed) })
+        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: session,
+                                            queue: nil) { [weak self] _ in self?.report(.changed) })
+        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
+                                            queue: nil) { [weak self] _ in self?.report(.changed) })
+    }
+
+    deinit {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    /// The notifications arrive on the system's threads, and the engine must
+    /// not be touched from inside them.
+    private func report(_ change: Change) {
+        guard let onChange else { return }
+        Task { @MainActor in onChange(change) }
+    }
+
+    var isRunning: Bool { engine.isRunning }
 
     /// Opens the session and starts the engine. The reply plays at `outputRate`.
     func start(outputRate: Int) throws {
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker])
+        // Bluetooth is spelled out so AirPods and car kits are used when connected.
+        try session.setCategory(.playAndRecord, mode: .voiceChat,
+                                options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
         try session.setActive(true)
+        self.outputRate = outputRate
         if !configured {
             // Echo cancellation. Without it the mic still works, only less cleanly.
             try? engine.inputNode.setVoiceProcessingEnabled(true)
+            // The mic's format follows the route: the tap is installed again with the current one.
+            if tapped {
+                engine.inputNode.removeTap(onBus: 0)
+                tapped = false
+            }
             let input = engine.inputNode.outputFormat(forBus: 0)
             guard input.sampleRate > 0, input.channelCount > 0 else { throw VoiceAudioError.noMicrophone }
             guard let format = AVAudioFormat(standardFormatWithSampleRate: Double(outputRate), channels: 1) else {
                 throw VoiceAudioError.badFormat(outputRate)
             }
-            engine.attach(player)
+            if !attached {
+                engine.attach(player)
+                attached = true
+            }
             engine.connect(player, to: engine.mainMixerNode, format: format)
-            sink.rate = input.sampleRate
+            sink.reset(rate: input.sampleRate)
             engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: input, block: sink.tap())
-            self.outputRate = outputRate
+            tapped = true
             configured = true
         }
         sink.resetBuffers()
@@ -57,12 +115,14 @@ final class VoiceAudio: @unchecked Sendable {
     /// Whether mic buffers arrived since the last start.
     var hearsInput: Bool { sink.buffers > 0 }
 
-    /// Stops and starts again. On an iPhone 13 Pro the first start after voice
-    /// processing is turned on sometimes leaves the mic silent (no buffers at
-    /// all) until the engine is restarted.
+    /// Stops and starts again, with the formats of the current route. On an
+    /// iPhone 13 Pro the first start after voice processing is turned on
+    /// sometimes leaves the mic silent (no buffers at all) until the engine is
+    /// restarted; an interruption or a new route stops the engine too.
     func restart() throws {
         player.stop()
         engine.stop()
+        configured = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         try start(outputRate: outputRate)
     }
@@ -187,7 +247,7 @@ final class VoiceAudio: @unchecked Sendable {
         private var samples: [Float] = []
         private var on = false
         private var count = 0
-        var rate = 48000.0
+        private(set) var rate = 48000.0
         private var traceOn = false
         private var trace: [(time: Double, level: Float, echo: Bool)] = []
 
@@ -211,6 +271,21 @@ final class VoiceAudio: @unchecked Sendable {
         func resetBuffers() {
             lock.lock()
             count = 0
+            lock.unlock()
+        }
+
+        /// The mic's rate changed: audio at the old rate is dropped and the
+        /// detector learns the noise floor again. The handler stays.
+        func reset(rate: Double) {
+            lock.lock()
+            if rate != self.rate {
+                self.rate = rate
+                samples.removeAll()
+                detector = VoiceDetector()
+                ring.removeAll()
+                turn.removeAll()
+                frame.removeAll()
+            }
             lock.unlock()
         }
 
@@ -336,12 +411,14 @@ enum VoiceAudioError: LocalizedError {
     case noMicrophone
     case badFormat(Int)
     case unreadable
+    case unstable
 
     var errorDescription: String? {
         switch self {
         case .noMicrophone: return "No microphone is available."
         case .badFormat(let rate): return "Can't play audio at \(rate) Hz."
         case .unreadable: return "Couldn't read the audio file."
+        case .unstable: return "The audio route keeps changing."
         }
     }
 }

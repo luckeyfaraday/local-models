@@ -78,6 +78,7 @@ struct ChatView: View {
             // Inactive (Control Center, an alert, the app switcher) leaves a reply
             // running. The background doesn't allow GPU work or an open mic.
             if phase == .background { chat.enterBackground() }
+            if phase == .active { chat.voice.checkAudio() }
         }
     }
 

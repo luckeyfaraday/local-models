@@ -90,6 +90,13 @@ final class VoiceViewModel {
     @ObservationIgnored private var muted = false
     @ObservationIgnored private var handsFreeInfo: ModelInfo?
     @ObservationIgnored private var testIndex = 0
+    /// Counts taps on the mic, so a start that was cancelled doesn't listen.
+    @ObservationIgnored private var listenAttempt = 0
+    @ObservationIgnored private var preparing = false
+    /// A phone call or Siri has the audio.
+    @ObservationIgnored private var interrupted = false
+    @ObservationIgnored private var recovery: Task<Void, Never>?
+    @ObservationIgnored private var recoveries: [Date] = []
 
     private struct Playback {
         var rate = 24000
@@ -105,6 +112,7 @@ final class VoiceViewModel {
 
     init(engine: LlamaEngine) {
         self.engine = engine
+        audio.onChange = { [weak self] change in self?.audioChanged(change) }
     }
 
     // MARK: - Actions
@@ -200,10 +208,72 @@ final class VoiceViewModel {
     func close() {
         if let info = handsFreeInfo { setHandsFree(false, info: info) }
         stop()
+        recovery?.cancel()
+        interrupted = false
         if audioRunning {
             audio.stop()
             audioRunning = false
         }
+    }
+
+    /// The app is on screen again: an interruption doesn't always say it ended.
+    func checkAudio() {
+        if audioRunning && (interrupted || !audio.isRunning) { recover() }
+    }
+
+    // MARK: - Interruptions and routes
+
+    private func audioChanged(_ change: VoiceAudio.Change) {
+        guard audioRunning, !preparing else { return }
+        switch change {
+        case .interrupted:
+            // The system has stopped the engine: nothing is heard or played until it's back.
+            interrupted = true
+            hearing = false
+            stop()
+        case .interruptionEnded:
+            recover()
+        case .changed:
+            // Only a change that stopped the engine needs anything done.
+            if !audio.isRunning && !interrupted { recover() }
+        }
+    }
+
+    /// Starts the engine again with the current route's formats. A hands-free
+    /// call goes on listening; a push-to-talk recording in progress is lost.
+    private func recover() {
+        guard recovery == nil else { return }
+        recovery = Task {
+            defer { recovery = nil }
+            // Changes come in bursts (the route, then its format): let them settle.
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard audioRunning, !preparing, !Task.isCancelled else { return }
+            guard interrupted || !audio.isRunning else { return }
+            if phase == .listening {
+                _ = audio.endRecording(rate: 16000)
+                phase = .idle
+            }
+            let now = Date()
+            recoveries = recoveries.filter { now.timeIntervalSince($0) < 10 } + [now]
+            do {
+                // A restart that keeps being undone would loop forever.
+                if recoveries.count > 4 { throw VoiceAudioError.unstable }
+                try audio.restart()
+                interrupted = false
+            } catch {
+                hangUp(error.localizedDescription)
+            }
+        }
+    }
+
+    /// The audio can't be brought back: end the call and say why. The next tap starts over.
+    private func hangUp(_ reason: String) {
+        if let info = handsFreeInfo { setHandsFree(false, info: info) }
+        stop()
+        audio.stop()
+        audioRunning = false
+        interrupted = false
+        if phase != .replying { phase = .failed("The audio stopped. \(reason) Tap the microphone to start again.") }
     }
 
     static var testFolder: URL { FileManager.default.temporaryDirectory.appendingPathComponent("VoiceTest") }
@@ -220,8 +290,12 @@ final class VoiceViewModel {
 
     private func listen(_ info: ModelInfo) {
         phase = .starting
+        listenAttempt += 1
+        let attempt = listenAttempt
         Task {
             guard await prepare(info) else { return }
+            // Tapped again while the microphone was starting: that was a stop.
+            guard attempt == listenAttempt, phase == .starting else { return }
             if AVAudioApplication.shared.recordPermission == .denied {
                 phase = .failed("Microphone access is off. Turn it on in Settings › Galerna Local Models.")
                 return
@@ -233,24 +307,40 @@ final class VoiceViewModel {
     }
 
     private func prepare(_ info: ModelInfo) async -> Bool {
-        guard !audioRunning else { return true }
+        if audioRunning && audio.isRunning && !interrupted { return true }
         if AVAudioApplication.shared.recordPermission == .undetermined {
             _ = await AVAudioApplication.requestRecordPermission()
         }
+        preparing = true
+        defer { preparing = false }
         do {
-            try audio.start(outputRate: info.audioOutputRate)
+            // Running in name only: an interruption or a new route stopped the engine.
+            if audioRunning { try audio.restart() } else { try audio.start(outputRate: info.audioOutputRate) }
             audioRunning = true
-            // A silent mic (no buffers yet) is restarted, at most twice.
-            for _ in 0..<2 {
-                try? await Task.sleep(nanoseconds: 400_000_000)
-                if audio.hearsInput { break }
-                try audio.restart()
+            interrupted = false
+            // Without permission no audio will come: listen() says so.
+            guard AVAudioApplication.shared.recordPermission == .granted else { return true }
+            // A silent mic (no buffers at all) is restarted, at most twice.
+            for restarts in 0..<3 {
+                if await micStarted() { break }
+                if restarts < 2 { try audio.restart() }
             }
             return true
         } catch {
+            audio.stop()
+            audioRunning = false
             phase = .failed(error.localizedDescription)
             return false
         }
+    }
+
+    /// Waits for the first mic buffer, which comes about 0.1 s after a good start.
+    private func micStarted() async -> Bool {
+        for _ in 0..<25 {
+            if audio.hearsInput { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return audio.hearsInput
     }
 
     /// The hands-free detector: a turn begins (or talks over the reply), or ends.
@@ -424,7 +514,8 @@ final class VoiceViewModel {
             // A little past the end: the speaker still rings for a moment.
             let left = playback.ends.timeIntervalSinceNow + 0.3
             if left <= 0 { break }
-            try? await Task.sleep(nanoseconds: UInt64(left * 1e9))
+            // In short steps: talking over the reply ends the wait at once.
+            try? await Task.sleep(nanoseconds: UInt64(min(left, 0.05) * 1e9))
         }
         let echo = audio.echoStats()
         if currentTurn == turn {
